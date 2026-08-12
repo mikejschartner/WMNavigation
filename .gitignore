@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
+
+# Virtual envs / local config
+.venv/
+venv/
+.env
+.env.*
+*.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Local caches / user data dumps
+cache/
+*.log
+
+# Don't ship built exe in git (releases carry it)
+WMNavigation.exe
+WMNavigation_update.exe

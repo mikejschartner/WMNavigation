@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build WMNavigation.exe
+        run: pyinstaller build.spec
+
+      - name: Write latest.json
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=$(cat <<'EOF'
+          ${{ github.event.head_commit.message }}
+          EOF
+          )
+          cat > dist/latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "versionName": "${VERSION}",
+            "downloadUrl": "https://github.com/mikejschartner/WMNavigation/releases/download/${GITHUB_REF_NAME}/WMNavigation.exe",
+            "releaseNotes": "${NOTES}"
+          }
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/WMNavigation.exe
+            dist/latest.json
+          generate_release_notes: true
