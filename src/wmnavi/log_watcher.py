@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import string
 import threading
 import time
 from pathlib import Path
@@ -72,6 +73,12 @@ RAID_END_PATTERNS = [
     re.compile(r"client/game/profile/select", re.I),
 ]
 
+_INSTALL_PATH_KEYS = re.compile(
+    r'"(?:InstallPath|GamePath|installDir|InstallDir|gamePath|path|Path|gameDirectory|'
+    r'GameDirectory|clientPath|ClientPath|eftPath|EftPath)"\s*:\s*"([^"]+)"',
+    re.I,
+)
+
 
 def normalize_location(token: str) -> str | None:
     key = re.sub(r"[^a-z0-9\-]+", "", (token or "").strip().lower().replace(" ", ""))
@@ -82,43 +89,211 @@ def normalize_location(token: str) -> str | None:
     )
 
 
+def _add_log_root(roots: list[Path], seen: set[str], path: Path) -> None:
+    try:
+        if path.is_dir():
+            key = str(path.resolve()).lower()
+            if key not in seen:
+                seen.add(key)
+                roots.append(path)
+    except OSError:
+        pass
+
+
+def _add_install_logs(roots: list[Path], seen: set[str], install: Path) -> None:
+    """Given an EFT install (or parent) folder, try Logs locations."""
+    candidates = [
+        install / "Logs",
+        install / "Escape from Tarkov" / "Logs",
+        install.parent / "Logs" if install.name.lower() != "logs" else install,
+    ]
+    for cand in candidates:
+        _add_log_root(roots, seen, cand)
+
+
+def _steam_library_roots() -> list[Path]:
+    """Parse libraryfolders.vdf from common Steam installs."""
+    vdf_candidates = [
+        Path(r"C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf"),
+        Path(r"C:\Program Files\Steam\steamapps\libraryfolders.vdf"),
+        Path.home() / "AppData/Local/Steam/steamapps/libraryfolders.vdf",
+        Path.home() / "AppData/Roaming/Steam/steamapps/libraryfolders.vdf",
+    ]
+    # Also check other drives for Steam
+    for letter in string.ascii_uppercase:
+        vdf_candidates.append(Path(f"{letter}:/Steam/steamapps/libraryfolders.vdf"))
+        vdf_candidates.append(Path(f"{letter}:/Program Files (x86)/Steam/steamapps/libraryfolders.vdf"))
+        vdf_candidates.append(Path(f"{letter}:/Program Files/Steam/steamapps/libraryfolders.vdf"))
+
+    libraries: list[Path] = []
+    seen: set[str] = set()
+    path_re = re.compile(r'"path"\s+"([^"]+)"', re.I)
+
+    for vdf in vdf_candidates:
+        try:
+            if not vdf.is_file():
+                continue
+            text = vdf.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for match in path_re.finditer(text):
+            raw = match.group(1).replace("\\\\", "\\")
+            lib = Path(raw)
+            key = str(lib).lower()
+            if key not in seen:
+                seen.add(key)
+                libraries.append(lib)
+        # Default library next to this vdf
+        default_lib = vdf.parent.parent  # .../Steam
+        key = str(default_lib).lower()
+        if key not in seen:
+            seen.add(key)
+            libraries.append(default_lib)
+    return libraries
+
+
+def _registry_install_paths() -> list[Path]:
+    paths: list[Path] = []
+    try:
+        import winreg
+    except ImportError:
+        return paths
+
+    def read_uninstall(hive, subkey: str):
+        try:
+            with winreg.OpenKey(hive, subkey) as root:
+                i = 0
+                while True:
+                    try:
+                        name = winreg.EnumKey(root, i)
+                    except OSError:
+                        break
+                    i += 1
+                    try:
+                        with winreg.OpenKey(root, name) as key:
+                            display, _ = winreg.QueryValueEx(key, "DisplayName")
+                            if "escape from tarkov" not in str(display).lower():
+                                continue
+                            try:
+                                loc, _ = winreg.QueryValueEx(key, "InstallLocation")
+                            except OSError:
+                                loc = ""
+                            if loc:
+                                paths.append(Path(str(loc)))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for sub in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        ):
+            read_uninstall(hive, sub)
+
+    # Battlestate / BSG keys
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for sub in (
+            r"SOFTWARE\Battlestate Games",
+            r"SOFTWARE\WOW6432Node\Battlestate Games",
+            r"SOFTWARE\BattlestateGames",
+            r"SOFTWARE\WOW6432Node\BattlestateGames",
+        ):
+            try:
+                with winreg.OpenKey(hive, sub) as root:
+                    i = 0
+                    while True:
+                        try:
+                            name = winreg.EnumKey(root, i)
+                        except OSError:
+                            break
+                        i += 1
+                        try:
+                            with winreg.OpenKey(root, name) as key:
+                                for value_name in (
+                                    "InstallLocation",
+                                    "InstallPath",
+                                    "Path",
+                                    "GamePath",
+                                ):
+                                    try:
+                                        loc, _ = winreg.QueryValueEx(key, value_name)
+                                        if loc:
+                                            paths.append(Path(str(loc)))
+                                    except OSError:
+                                        continue
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+    return paths
+
+
+def _launcher_install_paths() -> list[Path]:
+    paths: list[Path] = []
+    launcher_roots = [
+        Path.home() / "AppData/Local/Battlestate Games/BsgLauncher",
+        Path.home() / "AppData/Roaming/Battlestate Games/BsgLauncher",
+        Path.home() / "AppData/Local/BattlestateGames/BsgLauncher",
+    ]
+    for launcher in launcher_roots:
+        if not launcher.exists():
+            continue
+        for conf in launcher.rglob("*"):
+            if conf.suffix.lower() not in {".json", ".config", ".settings", ""}:
+                continue
+            if conf.is_dir():
+                continue
+            # Limit to plausible settings files
+            name_l = conf.name.lower()
+            if conf.suffix.lower() == "" and "setting" not in name_l and "config" not in name_l:
+                continue
+            try:
+                text = conf.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for match in _INSTALL_PATH_KEYS.finditer(text):
+                raw = match.group(1).replace("\\\\", "\\")
+                if "tarkov" in raw.lower() or "battlestate" in raw.lower() or ":" in raw:
+                    paths.append(Path(raw))
+    return paths
+
+
 def _game_install_log_roots() -> list[Path]:
     roots: list[Path] = []
     seen: set[str] = set()
 
-    def add(path: Path):
-        try:
-            if path.is_dir():
-                key = str(path.resolve()).lower()
-                if key not in seen:
-                    seen.add(key)
-                    roots.append(path)
-        except OSError:
-            pass
-
-    for drive in ("C", "D", "E", "F", "G"):
-        add(Path(f"{drive}:/Battlestate Games/Escape from Tarkov/Logs"))
-        add(Path(f"{drive}:/Games/Escape from Tarkov/Logs"))
-        add(Path(f"{drive}:/Escape from Tarkov/Logs"))
+    # Scan all drive letters for common install layouts.
+    for letter in string.ascii_uppercase:
+        drive = f"{letter}:"
+        for rel in (
+            "Battlestate Games/Escape from Tarkov/Logs",
+            "Games/Escape from Tarkov/Logs",
+            "Escape from Tarkov/Logs",
+            "Games/Battlestate Games/Escape from Tarkov/Logs",
+            "SteamLibrary/steamapps/common/Escape from Tarkov/Logs",
+            "Steam/steamapps/common/Escape from Tarkov/Logs",
+            "Program Files/Battlestate Games/Escape from Tarkov/Logs",
+            "Program Files (x86)/Battlestate Games/Escape from Tarkov/Logs",
+        ):
+            _add_log_root(roots, seen, Path(f"{drive}/{rel}"))
 
     local = Path.home() / "AppData" / "Local" / "Battlestate Games"
     if local.exists():
         for pattern in ("EscapeFromTarkov*/Logs", "Escape from Tarkov/Logs"):
             for path in local.glob(pattern):
-                add(path)
+                _add_log_root(roots, seen, path)
 
-    # Launcher may store install path.
-    launcher = Path.home() / "AppData" / "Local" / "Battlestate Games" / "BsgLauncher"
-    if launcher.exists():
-        for conf in launcher.rglob("*.json"):
-            try:
-                text = conf.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            for match in re.finditer(r'"(?:InstallPath|GamePath|installDir)"\s*:\s*"([^"]+)"', text, re.I):
-                raw = match.group(1).replace("\\\\", "\\")
-                add(Path(raw) / "Logs")
-                add(Path(raw) / "Escape from Tarkov" / "Logs")
+    for lib in _steam_library_roots():
+        _add_log_root(
+            roots,
+            seen,
+            lib / "steamapps" / "common" / "Escape from Tarkov" / "Logs",
+        )
+
+    for install in _launcher_install_paths() + _registry_install_paths():
+        _add_install_logs(roots, seen, install)
 
     return roots
 
@@ -142,6 +317,21 @@ def find_log_dir() -> Path | None:
         except OSError:
             continue
     return best
+
+
+def describe_log_search() -> str:
+    """Short status string listing what was searched / found."""
+    roots = _game_install_log_roots()
+    if not roots:
+        return (
+            "searched drives A–Z, Steam libraries, BSG launcher settings, and registry — none found"
+        )
+    chosen = find_log_dir()
+    if chosen:
+        return f"found {chosen}"
+    preview = "; ".join(str(r) for r in roots[:3])
+    extra = f" (+{len(roots) - 3} more)" if len(roots) > 3 else ""
+    return f"candidates without sessions: {preview}{extra}"
 
 
 def _latest_session_dir(log_root: Path) -> Path | None:
@@ -249,7 +439,7 @@ class LogWatcher(threading.Thread):
         while not self._stop.is_set():
             log_root = find_log_dir()
             if not log_root:
-                self._set_status("Log folder not found — map auto-detect offline")
+                self._set_status(f"Log folder not found — {describe_log_search()}")
                 time.sleep(3)
                 continue
 

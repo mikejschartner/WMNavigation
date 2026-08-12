@@ -37,7 +37,7 @@ from .floors import FloorOption, build_floor_options, floor_for_y
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
 from .item_filter_dialog import ItemFilterDialog
 from .layer_sidebar import MapLayersSidebar
-from .log_watcher import LogWatcher
+from .log_watcher import LogWatcher, describe_log_search, find_log_dir
 from .loot_filter import items_at_spot, spots_for_selection, spots_passing_price, visible_map_items
 from .loot_loader import GAME_MODES
 from .map_data_loader import load_map_layers
@@ -642,13 +642,19 @@ class MainWindow(QMainWindow):
         self._update_link_btn_label()
         self.refresh_player_quests()
 
-    def import_quests_from_logs(self):
+    def import_quests_from_logs(self, *, silent: bool = False):
         """Full Questie-style import from BSG client logs (can take a few seconds)."""
+        self._quest_import_silent = silent
         self.status_label.setText("Importing quests from EFT logs…")
         QApplication.processEvents()
 
         def work():
             try:
+                if find_log_dir() is None:
+                    self.bridge.quests_imported.emit(
+                        {"__error__": f"EFT Logs folder not found ({describe_log_search()})"}
+                    )
+                    return
                 states = import_quest_states_from_logs(prefer_mode=self.current_game_mode)
                 save_states(states)
                 self.bridge.quests_imported.emit(states)
@@ -659,8 +665,12 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_quests_imported(self, states):
+        silent = bool(getattr(self, "_quest_import_silent", False))
         if isinstance(states, dict) and states.get("__error__"):
-            QMessageBox.warning(self, "Quest import", states["__error__"])
+            msg = states["__error__"]
+            self.status_label.setText(msg)
+            if not silent:
+                QMessageBox.warning(self, "Quest import", msg)
             return
         if not isinstance(states, dict):
             return
@@ -669,11 +679,16 @@ class MainWindow(QMainWindow):
         active = state.active_ids()
         self.player_active_quest_ids = active if active else set()
         self._reload_quest_lists()
-        self.status_label.setText(
-            f"Imported from logs · {len(active)} active · "
-            f"{len(self.map_quests)} on this map · {len(self.anywhere_quests)} anywhere"
-        )
-        if not active:
+        if active:
+            self.status_label.setText(
+                f"Imported from logs · {len(active)} active · "
+                f"{len(self.map_quests)} on this map · {len(self.anywhere_quests)} anywhere"
+            )
+        else:
+            self.status_label.setText(
+                "No quests in logs yet — accept quests in-game"
+            )
+        if not active and not silent:
             QMessageBox.information(
                 self,
                 "Quest import",
@@ -1192,8 +1207,8 @@ class MainWindow(QMainWindow):
         )
         self.quest_log_watcher.start()
         self._start_screenshot_watch()
-        # First-run / refresh: import quest history from logs in background.
-        QTimer.singleShot(800, self.import_quests_from_logs)
+        # First-run / refresh: import quest history from logs in background (no modal).
+        QTimer.singleShot(800, lambda: self.import_quests_from_logs(silent=True))
 
     def closeEvent(self, event):
         self._screenshot_poll.stop()
@@ -1299,8 +1314,13 @@ class MainWindow(QMainWindow):
         note = ""
         if not svg_path:
             note = " · tile map"
-        if total_extracts == 0 and total_containers == 0:
-            note += " · no layer data yet"
+        layers_empty = (
+            total_extracts == 0
+            and total_containers == 0
+            and len(self.layer_data.loose_loot) == 0
+        )
+        if layers_empty:
+            note += " · no layer data — check net / Refresh map"
         active_q = len(self.active_quest_ids)
         linked = ""
         if self.linked_nickname or self.linked_account_id:

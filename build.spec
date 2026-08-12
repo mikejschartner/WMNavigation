@@ -10,6 +10,7 @@ a = Analysis(
     datas=[
         (str(root / "assets"), "assets"),
         (str(root / "data" / "maps.json"), "data"),
+        (str(root / "data" / "questie"), "data/questie"),
     ],
     hiddenimports=["PySide6.QtSvg"],
     hookspath=[],

@@ -1,17 +1,45 @@
-"""Read bundled TarkovQuestie data when the API is unavailable."""
+"""Resolve TarkovQuestie-compatible data dumps (bundled or installed)."""
 
 from __future__ import annotations
 
 import json
+import sys
 from functools import lru_cache
 from pathlib import Path
 
+from .paths import app_root, is_frozen
+
+
+def _folder_has_questie_data(folder: Path) -> bool:
+    """True if folder looks usable for layers and/or quests."""
+    if not folder.is_dir():
+        return False
+    # Layers need maps.json; quests need tasks.json. Accept either so partial packs still resolve.
+    return (folder / "maps.json").exists() or (folder / "tasks.json").exists()
+
 
 def questie_data_dir(mode: str) -> Path | None:
-    base = Path.home() / "AppData/Local/Programs/TarkovQuestie/_internal/data"
-    folder = base / mode
-    if folder.exists():
-        return folder
+    """Locate mode data: bundled → next-to-exe → TarkovQuestie → LocalAppData override."""
+    candidates: list[Path] = [
+        app_root() / "data" / "questie" / mode,
+    ]
+    if is_frozen():
+        candidates.append(Path(sys.executable).resolve().parent / "data" / "questie" / mode)
+    candidates.append(
+        Path.home() / "AppData/Local/Programs/TarkovQuestie/_internal/data" / mode
+    )
+    candidates.append(Path.home() / "AppData/Local/WMNavigation/questie" / mode)
+
+    for folder in candidates:
+        try:
+            if _folder_has_questie_data(folder):
+                return folder
+        except OSError:
+            continue
+
+    # Season / Kord often reuses regular item dumps if mode folder is incomplete.
+    if mode != "regular":
+        return questie_data_dir("regular")
     return None
 
 

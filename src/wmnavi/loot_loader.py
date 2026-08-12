@@ -9,6 +9,7 @@ import requests
 
 from .models import ItemInfo, LootSpot
 from .paths import cache_dir
+from .questie_source import questie_data_dir as _questie_data_dir
 
 API_URL = "https://api.tarkov.dev/graphql"
 ITEMS_CACHE_VERSION = 4
@@ -62,18 +63,6 @@ query Items($gameMode: GameMode) {
   }
 }
 """
-
-
-def _questie_data_dir(mode: str) -> Path | None:
-    base = Path.home() / "AppData/Local/Programs/TarkovQuestie/_internal/data"
-    folder = base / mode
-    if folder.exists():
-        return folder
-    # Kord / season mode often only has regular item dumps.
-    regular = base / "regular"
-    if regular.exists():
-        return regular
-    return None
 
 
 def _best_trader(sell_for: list[dict]) -> tuple[int, str]:
