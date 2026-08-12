@@ -52,11 +52,12 @@ class LayerVisibility:
 
 
 class PlayerMarker(QGraphicsPixmapItem):
-    """Custom arrow marker — circle = position, arrow = look direction."""
+    """Precision marker — black dot = position, red arrow = look direction."""
 
-    def __init__(self, size_px: float = 52):
+    def __init__(self, size_px: float = 28):
         pix = load_player_marker_pixmap(size_px)
         super().__init__(pix)
+        # Center of pixmap (black dot) sits on true map coordinates.
         self.setOffset(-pix.width() / 2, -pix.height() / 2)
         self.setZValue(2000)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
@@ -68,7 +69,7 @@ class PlayerMarker(QGraphicsPixmapItem):
     def set_state(self, x: float, y: float, yaw_deg: float, map_rotation: int):
         self._state = (x, y, yaw_deg, map_rotation)
         self.setPos(x, y)
-        # Asset arrow points up (north). Qt rotates clockwise; map_rotation matches CRS.
+        # Drawn arrow points up (north). Qt rotates clockwise; map_rotation matches CRS.
         self.setRotation(yaw_deg + map_rotation)
 
 
@@ -140,7 +141,8 @@ class MapView(QGraphicsView):
         self._marker_items: list[QGraphicsItem] = []
         self._marker_scale = 0.85
         self._refreshing = False
-        self.player = PlayerMarker(self._px(52))
+        # Small screen-space marker so the black dot stays precise while zooming.
+        self.player = PlayerMarker(self._px(28))
         self.scene.addItem(self.player)
         self.player.hide()
 
@@ -163,7 +165,7 @@ class MapView(QGraphicsView):
         old = self.player
         was_visible = old.isVisible()
         old_state = getattr(old, "_state", None)
-        self.player = PlayerMarker(self._px(52))
+        self.player = PlayerMarker(self._px(28))
         self.scene.addItem(self.player)
         if old.scene():
             self.scene.removeItem(old)

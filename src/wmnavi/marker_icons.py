@@ -245,49 +245,50 @@ def get_location_pin(color: str = "#c084fc", size: float = 8) -> QPixmap:
     return pix
 
 
-def load_player_marker_pixmap(size: float = 52) -> QPixmap:
-    """Load the custom player arrow (circle = feet, arrow = facing)."""
-    from .paths import app_root
+def load_player_marker_pixmap(size: float = 28) -> QPixmap:
+    """Precision player marker: small black position dot + red facing arrow."""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QPolygonF
 
-    size_i = max(24, int(round(size)))
-    cache = _cache_key("player", "arrow_thick", size_i)
+    # Keep canvas compact so the black dot stays near true map position.
+    size_i = max(18, int(round(size)))
+    cache = _cache_key("player", "dot_arrow_v2", size_i)
     if cache in _ICON_CACHE:
         return _ICON_CACHE[cache]
 
-    path = app_root() / "assets" / "player_marker.png"
-    source = QPixmap(str(path)) if path.exists() else QPixmap()
-    if source.isNull():
-        # Fallback drawn marker if asset is missing.
-        def draw(painter: QPainter, sz: int):
-            cx = cy = sz / 2
-            painter.setPen(QPen(QColor("#ffffff"), max(3, sz // 14)))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawEllipse(int(sz * 0.14), int(sz * 0.14), int(sz * 0.72), int(sz * 0.72))
-            painter.setPen(QPen(QColor("#b91c1c"), max(4, sz // 10), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(int(cx), int(cy), int(cx), int(sz * 0.12))
-            painter.setBrush(QColor("#b91c1c"))
-            painter.setPen(Qt.PenStyle.NoPen)
-            from PySide6.QtCore import QPointF
-            from PySide6.QtGui import QPolygonF
-
-            tip = QPolygonF(
-                [
-                    QPointF(cx, sz * 0.05),
-                    QPointF(cx - sz * 0.16, sz * 0.28),
-                    QPointF(cx + sz * 0.16, sz * 0.28),
-                ]
+    def draw(painter: QPainter, sz: int):
+        cx = cy = sz / 2.0
+        # Red facing arrow (points up / north before rotation).
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(
+            QPen(
+                QColor("#dc2626"),
+                max(1.5, sz * 0.08),
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
             )
-            painter.drawPolygon(tip)
-
-        pix = _draw_pixmap(size_i, draw)
-    else:
-        pix = source.scaled(
-            size_i,
-            size_i,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
         )
+        tip_y = sz * 0.08
+        painter.drawLine(QPointF(cx, cy), QPointF(cx, tip_y + sz * 0.12))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#dc2626"))
+        tip = QPolygonF(
+            [
+                QPointF(cx, tip_y),
+                QPointF(cx - sz * 0.14, tip_y + sz * 0.22),
+                QPointF(cx + sz * 0.14, tip_y + sz * 0.22),
+            ]
+        )
+        painter.drawPolygon(tip)
 
+        # Black feet/position dot centered on true coordinates.
+        dot = max(3, int(round(sz * 0.22)))
+        painter.setBrush(QColor("#0a0a0a"))
+        painter.setPen(QPen(QColor("#f5f5f5"), max(1, sz // 18)))
+        painter.drawEllipse(int(cx - dot / 2), int(cy - dot / 2), dot, dot)
+
+    pix = _draw_pixmap(size_i, draw)
     _ICON_CACHE[cache] = pix
     return pix
 
