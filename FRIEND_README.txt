@@ -6,6 +6,15 @@ How to run
 1. Unzip this folder anywhere (Desktop is fine).
 2. Double-click "Launch WMNavigation.bat" or WMNavigation.exe.
 
+Friend raid share
+-----------------
+In the sidebar under "Friend raid share":
+1. Enter a display name and pick your Color (what friends see).
+2. Agree on a room code with your squad and click Join.
+3. Press V in raid (or use Continuous mode) — your position is shared.
+4. Friends on the same map see your colored marker + facing arrow.
+Stale pings drop after about 60 seconds. Leave the room when done.
+
 Quests & map data
 -----------------
 Quest lists and map layers (extracts, loot, containers, items) are

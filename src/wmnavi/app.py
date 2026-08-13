@@ -8,15 +8,17 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -36,6 +38,7 @@ from .assets import cache_remote_file
 from .coords import PlayerState
 from .data_loader import get_interactive_map, list_map_names
 from .floors import FloorOption, build_floor_options, floor_for_y
+from .friend_sync import FriendSync, new_player_id
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
 from .item_filter_dialog import ItemFilterDialog
 from .layer_sidebar import MapLayersSidebar
@@ -103,6 +106,8 @@ class Bridge(QObject):
     screenshot_parsed = Signal(object)
     quest_events = Signal(object)
     quests_imported = Signal(object)
+    friend_update = Signal(object)
+    friend_status = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -120,6 +125,19 @@ class MainWindow(QMainWindow):
         self.bridge.screenshot_parsed.connect(self.on_player_update)
         self.bridge.quest_events.connect(self.on_quest_log_events)
         self.bridge.quests_imported.connect(self.on_quests_imported)
+        self.bridge.friend_update.connect(self.on_friend_update)
+        self.bridge.friend_status.connect(self.on_friend_status)
+
+        player_id = str(self.settings.value("friend_player_id", "") or "")
+        if not player_id:
+            player_id = new_player_id()
+            self.settings.setValue("friend_player_id", player_id)
+        self.friend_sync = FriendSync(
+            player_id,
+            on_update=lambda snaps: self.bridge.friend_update.emit(snaps),
+            on_status=lambda text: self.bridge.friend_status.emit(str(text)),
+        )
+        self._friend_color = str(self.settings.value("friend_color", "#38bdf8") or "#38bdf8")
 
         self.current_map_slug = "customs"
         self.current_game_mode = self.settings.value("game_mode", "regular")
@@ -162,11 +180,15 @@ class MainWindow(QMainWindow):
         self._screenshot_poll.timeout.connect(self._poll_screenshots)
         self._live_timer = QTimer(self)
         self._live_timer.timeout.connect(self._on_live_tick)
+        self._friend_prune_timer = QTimer(self)
+        self._friend_prune_timer.setInterval(5000)
+        self._friend_prune_timer.timeout.connect(self._refresh_friend_markers)
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
         self.load_map(self.current_map_slug)
         self.start_watchers()
+        self._friend_prune_timer.start()
 
     def _layer_settings_prefix(self) -> str:
         return f"layers/{self.current_game_mode}/{self.current_map_slug}"
@@ -321,6 +343,35 @@ class MainWindow(QMainWindow):
         self.live_interval.valueChanged.connect(self.on_live_interval_changed)
         live_row.addWidget(self.live_interval)
         bottom_layout.addLayout(live_row)
+
+        bottom_layout.addWidget(QLabel("Friend raid share"))
+        self.friend_name_edit = QLineEdit()
+        self.friend_name_edit.setPlaceholderText("Display name")
+        self.friend_name_edit.setText(str(self.settings.value("friend_name", "") or ""))
+        self.friend_name_edit.setMaxLength(24)
+        bottom_layout.addWidget(self.friend_name_edit)
+        self.friend_room_edit = QLineEdit()
+        self.friend_room_edit.setPlaceholderText("Room code (share with friends)")
+        self.friend_room_edit.setText(str(self.settings.value("friend_room", "") or ""))
+        self.friend_room_edit.setMaxLength(24)
+        bottom_layout.addWidget(self.friend_room_edit)
+        friend_row = QHBoxLayout()
+        self.btn_friend_color = QPushButton("Color")
+        self.btn_friend_color.setToolTip("Color friends see you as on their map")
+        self.btn_friend_color.clicked.connect(self.pick_friend_color)
+        self._apply_friend_color_btn()
+        friend_row.addWidget(self.btn_friend_color)
+        self.btn_friend_join = QPushButton("Join")
+        self.btn_friend_join.clicked.connect(self.join_friend_room)
+        friend_row.addWidget(self.btn_friend_join)
+        self.btn_friend_leave = QPushButton("Leave")
+        self.btn_friend_leave.clicked.connect(self.leave_friend_room)
+        friend_row.addWidget(self.btn_friend_leave)
+        bottom_layout.addLayout(friend_row)
+        self.friend_status_label = QLabel("Not in a room")
+        self.friend_status_label.setObjectName("status")
+        self.friend_status_label.setWordWrap(True)
+        bottom_layout.addWidget(self.friend_status_label)
 
         bottom_layout.addWidget(QLabel("Tarkov screenshots (press V in-raid)"))
         self.screenshot_path_label = QLabel(str(self.screenshot_dir))
@@ -1108,6 +1159,82 @@ class MainWindow(QMainWindow):
             f"Position locked · X {state.x:.1f}  Y {state.y:.1f}  Z {state.z:.1f}  "
             f"Facing {state.yaw_deg:.0f}° · {floor_label}"
         )
+        if self.friend_sync.room:
+            self.friend_sync.publish_position(
+                map_slug=self.current_map_slug,
+                x=state.x,
+                y=state.y,
+                z=state.z,
+                yaw_deg=state.yaw_deg,
+                name=self.friend_name_edit.text(),
+                color=self._friend_color,
+            )
+
+    def _apply_friend_color_btn(self):
+        color = self._friend_color if str(self._friend_color).startswith("#") else f"#{self._friend_color}"
+        self.btn_friend_color.setStyleSheet(
+            f"QPushButton {{ background: {color}; color: #0a0a0f; font-weight: 600; }}"
+        )
+
+    def pick_friend_color(self):
+        current = QColor(self._friend_color)
+        if not current.isValid():
+            current = QColor("#38bdf8")
+        chosen = QColorDialog.getColor(current, self, "Your marker color")
+        if not chosen.isValid():
+            return
+        self._friend_color = chosen.name()
+        self.settings.setValue("friend_color", self._friend_color)
+        self._apply_friend_color_btn()
+        if self.friend_sync.room and self.friend_sync._last_pos:
+            self.friend_sync.publish_position(
+                **self.friend_sync._last_pos,
+                name=self.friend_name_edit.text(),
+                color=self._friend_color,
+            )
+
+    def join_friend_room(self):
+        name = self.friend_name_edit.text().strip() or "Operator"
+        room = self.friend_room_edit.text().strip()
+        self.settings.setValue("friend_name", name)
+        self.settings.setValue("friend_room", room)
+        self.settings.setValue("friend_color", self._friend_color)
+        ok = self.friend_sync.join(room, name, self._friend_color)
+        self.btn_friend_join.setEnabled(not ok)
+        if ok and self.friend_sync._last_pos:
+            self.friend_sync.publish_position(
+                **self.friend_sync._last_pos,
+                name=name,
+                color=self._friend_color,
+            )
+
+    def leave_friend_room(self):
+        self.friend_sync.leave()
+        self.btn_friend_join.setEnabled(True)
+        self.friend_status_label.setText("Not in a room")
+        self.map_view.set_friends([], self.current_map_slug)
+
+    @Slot(object)
+    def on_friend_update(self, snaps):
+        pings = list((snaps or {}).values())
+        self.map_view.set_friends(pings, self.current_map_slug)
+        if self.friend_sync.room:
+            n = self.friend_sync.live_count(self.current_map_slug)
+            total = self.friend_sync.live_count()
+            self.friend_status_label.setText(
+                f"Room {self.friend_sync.room} · {total} friend(s) · {n} on this map"
+            )
+
+    @Slot(str)
+    def on_friend_status(self, text: str):
+        self.friend_status_label.setText(text)
+        self.btn_friend_join.setEnabled(not bool(self.friend_sync.room))
+
+    def _refresh_friend_markers(self):
+        if not self.friend_sync.room:
+            return
+        snaps = self.friend_sync.friends_snapshot()
+        self.map_view.set_friends(list(snaps.values()), self.current_map_slug)
 
     def choose_screenshot_dir(self):
         start = str(self.screenshot_dir if self.screenshot_dir.exists() else Path.home())
@@ -1248,6 +1375,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._screenshot_poll.stop()
         self._live_timer.stop()
+        self._friend_prune_timer.stop()
+        try:
+            self.friend_sync.leave()
+        except Exception:
+            pass
         if hasattr(self, "observer") and self.observer:
             self.observer.stop()
             self.observer.join(timeout=2)
@@ -1406,6 +1538,7 @@ class MainWindow(QMainWindow):
             f"{f' · {len(self.anywhere_quests)} anywhere' if self.anywhere_quests else ''}"
             f"{linked}{note}"
         )
+        self._refresh_friend_markers()
 
 
 def run():

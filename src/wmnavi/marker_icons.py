@@ -245,24 +245,27 @@ def get_location_pin(color: str = "#c084fc", size: float = 8) -> QPixmap:
     return pix
 
 
-def load_player_marker_pixmap(size: float = 28) -> QPixmap:
-    """Precision player marker: bright green position dot + green facing arrow."""
+def load_player_marker_pixmap(size: float = 28, color: str = "#22ff55") -> QPixmap:
+    """Precision player/friend marker: colored dot + matching facing arrow."""
     from PySide6.QtCore import QPointF
     from PySide6.QtGui import QPolygonF
 
-    # Keep canvas compact so the green dot stays near true map position.
     size_i = max(18, int(round(size)))
-    cache = _cache_key("player", "dot_arrow_green_v1", size_i)
+    color_key = (color or "#22ff55").lower()
+    cache = _cache_key("player", f"dot_arrow_{color_key}", size_i)
     if cache in _ICON_CACHE:
         return _ICON_CACHE[cache]
 
     def draw(painter: QPainter, sz: int):
         cx = cy = sz / 2.0
-        green = QColor("#22ff55")
+        fill = QColor(color_key)
+        if not fill.isValid():
+            fill = QColor("#22ff55")
+        outline = QColor("#0a0a0f")
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(
             QPen(
-                green,
+                fill,
                 max(2.0, sz * 0.10),
                 Qt.PenStyle.SolidLine,
                 Qt.PenCapStyle.RoundCap,
@@ -272,7 +275,7 @@ def load_player_marker_pixmap(size: float = 28) -> QPixmap:
         tip_y = sz * 0.08
         painter.drawLine(QPointF(cx, cy), QPointF(cx, tip_y + sz * 0.12))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(green)
+        painter.setBrush(fill)
         tip = QPolygonF(
             [
                 QPointF(cx, tip_y),
@@ -282,15 +285,18 @@ def load_player_marker_pixmap(size: float = 28) -> QPixmap:
         )
         painter.drawPolygon(tip)
 
-        # Bright green feet/position dot centered on true coordinates.
         dot = max(4, int(round(sz * 0.28)))
-        painter.setBrush(green)
-        painter.setPen(QPen(QColor("#052e16"), max(1, sz // 16)))
+        painter.setBrush(fill)
+        painter.setPen(QPen(outline, max(1, sz // 16)))
         painter.drawEllipse(int(cx - dot / 2), int(cy - dot / 2), dot, dot)
 
     pix = _draw_pixmap(size_i, draw)
     _ICON_CACHE[cache] = pix
     return pix
+
+
+def load_friend_marker_pixmap(size: float = 28, color: str = "#38bdf8") -> QPixmap:
+    return load_player_marker_pixmap(size, color=color)
 
 
 def get_usable_icon(kind: str, size: float = 4) -> QPixmap:

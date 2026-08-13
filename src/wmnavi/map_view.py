@@ -32,6 +32,7 @@ from .marker_icons import (
     get_loose_loot_icon,
     get_quest_marker,
     get_usable_icon,
+    load_friend_marker_pixmap,
     load_player_marker_pixmap,
 )
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
@@ -145,8 +146,10 @@ class MapView(QGraphicsView):
         self._price_filter_ids: set[str] | None = None
         self._hide_loose_stars = False
         self._quest_spots: list[MapPoint] = []
+        self._friend_pings: list = []
         self._haze_off_floor = True
         self._marker_items: list[QGraphicsItem] = []
+        self._friend_items: list[QGraphicsItem] = []
         self._marker_scale = 0.85
         self._refreshing = False
         # Small screen-space marker so the black dot stays precise while zooming.
@@ -438,6 +441,13 @@ class MapView(QGraphicsView):
         if refresh:
             self.refresh_layers()
 
+    def set_friends(self, pings: list, map_slug: str):
+        """Show friend pings that are on the current map."""
+        self._friend_pings = [
+            p for p in (pings or []) if getattr(p, "map_slug", "") == map_slug
+        ]
+        self._redraw_friends()
+
     def apply_layer_state(
         self,
         visibility: LayerVisibility,
@@ -456,6 +466,48 @@ class MapView(QGraphicsView):
         self._quest_spots = list(quest_spots or [])
         self._haze_off_floor = haze_off_floor
         self.refresh_layers()
+
+    def _clear_friends(self):
+        for item in self._friend_items:
+            if item.scene():
+                self.scene.removeItem(item)
+        self._friend_items.clear()
+
+    def _redraw_friends(self):
+        self._clear_friends()
+        for ping in self._friend_pings:
+            mx, my = game_to_map(ping.x, ping.z, self.map_rotation, self.map_transform)
+            if not self._in_map_bounds(mx, my):
+                continue
+            on_floor = self._on_active_floor(ping.y)
+            opacity = 1.0 if on_floor else 0.35
+            color = getattr(ping, "color", None) or "#38bdf8"
+            pix = load_friend_marker_pixmap(self._px(28), color=color)
+            group = ScreenAnchor()
+            marker = QGraphicsPixmapItem(pix)
+            marker.setOffset(-pix.width() / 2, -pix.height() / 2)
+            marker.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+            marker.setRotation(float(getattr(ping, "yaw_deg", 0)) + self.map_rotation)
+            marker.setToolTip(
+                f"{ping.name}\nFacing {float(getattr(ping, 'yaw_deg', 0)):.0f}°"
+            )
+            group.addToGroup(marker)
+
+            text = QGraphicsSimpleTextItem(str(ping.name))
+            text.setBrush(QBrush(QColor(color)))
+            text.setPen(QPen(QColor("#0a0a0f"), 1))
+            font = QFont("Segoe UI", max(8, self._px(9)))
+            font.setBold(True)
+            text.setFont(font)
+            br = text.boundingRect()
+            text.setPos(-br.width() / 2, pix.height() / 2 + 2)
+            group.addToGroup(text)
+
+            group.setPos(mx, my)
+            group.setZValue(1900)
+            group.setOpacity(opacity)
+            self.scene.addItem(group)
+            self._friend_items.append(group)
 
     def _on_active_floor(self, y: float) -> bool:
         if self._floor.label.lower() == "all floors":
@@ -665,6 +717,7 @@ class MapView(QGraphicsView):
                         "quest",
                         label=tip,
                     )
+            self._redraw_friends()
         finally:
             self._refreshing = False
 
