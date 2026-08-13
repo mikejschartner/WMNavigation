@@ -1,12 +1,11 @@
-"""Global F7/F8 hotkeys via Win32 RegisterHotKey (works while Tarkov is focused)."""
+"""Global F7/F8 hotkeys via Win32 RegisterHotKey on the main window HWND."""
 
 from __future__ import annotations
 
 import ctypes
-import threading
 from ctypes import wintypes
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, Signal
 
 user32 = ctypes.windll.user32
 
@@ -14,82 +13,94 @@ VK_F7 = 0x76
 VK_F8 = 0x77
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
-WM_QUIT = 0x0012
-HWND_MESSAGE = wintypes.HWND(-3)
+
+user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+
+
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    def __init__(self, owner: "GlobalHotkeys"):
+        super().__init__()
+        self._owner = owner
+
+    def nativeEventFilter(self, eventType, message):
+        try:
+            if isinstance(eventType, (bytes, bytearray)):
+                et = eventType.decode("ascii", errors="ignore")
+            else:
+                et = str(eventType)
+            if "windows" not in et:
+                return False, 0
+            addr = int(message)
+            msg = ctypes.cast(addr, ctypes.POINTER(wintypes.MSG)).contents
+            if int(msg.message) != WM_HOTKEY:
+                return False, 0
+            wid = int(msg.wParam)
+            if wid == 1:
+                self._owner.pressed.emit("f7")
+                return True, 0
+            if wid == 2:
+                self._owner.pressed.emit("f8")
+                return True, 0
+        except Exception:
+            pass
+        return False, 0
 
 
 class GlobalHotkeys(QObject):
-    """Background message loop; emits key names on the Qt thread via queued signals."""
+    """Register F7/F8 on the app window so hotkeys work even when Tarkov is focused."""
 
     pressed = Signal(str)  # "f7" | "f8"
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._thread: threading.Thread | None = None
-        self._thread_id = 0
-        self._running = False
+        self._hwnd = 0
+        self._filter: _HotkeyFilter | None = None
+        self._app = None
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run, name="wmnavi-hotkeys", daemon=True)
-        self._thread.start()
+    def start(self, hwnd: int):
+        """Bind hotkeys to an existing top-level window handle."""
+        self.stop()
+        hwnd = int(hwnd or 0)
+        if hwnd <= 0:
+            return False
+        self._hwnd = hwnd
+        try:
+            # Prefer no-repeat; fall back to plain modifiers if the OS rejects it.
+            ok7 = bool(user32.RegisterHotKey(self._hwnd, 1, MOD_NOREPEAT, VK_F7))
+            if not ok7:
+                ok7 = bool(user32.RegisterHotKey(self._hwnd, 1, 0, VK_F7))
+            ok8 = bool(user32.RegisterHotKey(self._hwnd, 2, MOD_NOREPEAT, VK_F8))
+            if not ok8:
+                ok8 = bool(user32.RegisterHotKey(self._hwnd, 2, 0, VK_F8))
+            if not ok7 and not ok8:
+                self._hwnd = 0
+                return False
+            from PySide6.QtWidgets import QApplication
+
+            self._app = QApplication.instance()
+            self._filter = _HotkeyFilter(self)
+            if self._app is not None:
+                self._app.installNativeEventFilter(self._filter)
+            return True
+        except Exception:
+            self.stop()
+            return False
 
     def stop(self):
-        self._running = False
-        tid = self._thread_id
-        if tid:
+        if self._filter is not None and self._app is not None:
             try:
-                user32.PostThreadMessageW(tid, WM_QUIT, 0, 0)
+                self._app.removeNativeEventFilter(self._filter)
             except Exception:
                 pass
-        if self._thread:
-            self._thread.join(timeout=2)
-            self._thread = None
-        self._thread_id = 0
-
-    def _run(self):
-        self._thread_id = int(ctypes.windll.kernel32.GetCurrentThreadId())
-        hwnd = user32.CreateWindowExW(
-            0,
-            "STATIC",
-            "wmnavi-hotkeys",
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            None,
-            None,
-            None,
-        )
-        if not hwnd:
-            return
-        try:
-            user32.RegisterHotKey(hwnd, 1, MOD_NOREPEAT, VK_F7)
-            user32.RegisterHotKey(hwnd, 2, MOD_NOREPEAT, VK_F8)
-            msg = wintypes.MSG()
-            while self._running:
-                ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-                if ret == 0 or ret == -1:
-                    break
-                if msg.message == WM_HOTKEY:
-                    if int(msg.wParam) == 1:
-                        self.pressed.emit("f7")
-                    elif int(msg.wParam) == 2:
-                        self.pressed.emit("f8")
-                else:
-                    user32.TranslateMessage(ctypes.byref(msg))
-                    user32.DispatchMessageW(ctypes.byref(msg))
-        finally:
+        self._filter = None
+        self._app = None
+        if self._hwnd:
             try:
-                user32.UnregisterHotKey(hwnd, 1)
-                user32.UnregisterHotKey(hwnd, 2)
+                user32.UnregisterHotKey(self._hwnd, 1)
+                user32.UnregisterHotKey(self._hwnd, 2)
             except Exception:
                 pass
-            try:
-                user32.DestroyWindow(hwnd)
-            except Exception:
-                pass
+        self._hwnd = 0

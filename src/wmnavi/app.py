@@ -104,7 +104,6 @@ class Bridge(QObject):
     quests_imported = Signal(object)
     friend_update = Signal(object)
     friend_status = Signal(str)
-    hotkey = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -178,14 +177,38 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
-        self.minimap = MiniMapWindow(size_px=int(self.settings.value("minimap_size", 300)))
+        try:
+            self.minimap = MiniMapWindow(size_px=int(self.settings.value("minimap_size", 300) or 300))
+        except Exception:
+            self.minimap = None
         self.hotkeys = GlobalHotkeys(self)
-        self.hotkeys.pressed.connect(self.bridge.hotkey.emit)
-        self.bridge.hotkey.connect(self.on_global_hotkey)
-        self.hotkeys.start()
+        self.hotkeys.pressed.connect(self.on_global_hotkey)
         self.load_map(self.current_map_slug)
         self.start_watchers()
         self._friend_prune_timer.start()
+        # Hotkeys need a real HWND — register after first show.
+        QTimer.singleShot(0, self._start_global_hotkeys)
+
+    def _start_global_hotkeys(self):
+        try:
+            # Ensure Win32 handle exists
+            self.winId()
+            hwnd = int(self.winId())
+            ok = self.hotkeys.start(hwnd)
+            if not ok:
+                # One more try after the window is fully mapped
+                QTimer.singleShot(500, self._retry_global_hotkeys)
+        except Exception:
+            pass
+
+    def _retry_global_hotkeys(self):
+        try:
+            hwnd = int(self.winId())
+            if self.hotkeys.start(hwnd):
+                return
+            self.status_label.setText("Mini map hotkeys unavailable (F7/F8 already in use)")
+        except Exception:
+            pass
 
     def _layer_settings_prefix(self) -> str:
         return f"layers/{self.current_game_mode}/{self.current_map_slug}"
@@ -695,11 +718,14 @@ class MainWindow(QMainWindow):
         self.layer_sidebar.save_settings(prefix, self.settings)
         self.refresh_map_layers()
 
+    def _minimap_ok(self) -> bool:
+        return bool(getattr(self, "minimap", None))
+
     def on_floor_changed(self, index: int):
         if 0 <= index < len(self.floor_options):
             floor = self.floor_options[index]
             self.map_view.set_floor(floor)
-            if hasattr(self, "minimap"):
+            if self._minimap_ok():
                 self.minimap.map_view.set_floor(floor)
                 if self.minimap.isVisible() and self._last_player:
                     self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
@@ -926,14 +952,14 @@ class MainWindow(QMainWindow):
         if self.floor_combo.currentIndex() == idx:
             # Still ensure map_view floor is set (e.g. after map reload).
             self.map_view.set_floor(match)
-            if hasattr(self, "minimap"):
+            if self._minimap_ok():
                 self.minimap.map_view.set_floor(match)
             return
         self.floor_combo.blockSignals(True)
         self.floor_combo.setCurrentIndex(idx)
         self.floor_combo.blockSignals(False)
         self.map_view.set_floor(match)
-        if hasattr(self, "minimap"):
+        if self._minimap_ok():
             self.minimap.map_view.set_floor(match)
 
     def _build_visibility(self) -> LayerVisibility:
@@ -967,12 +993,12 @@ class MainWindow(QMainWindow):
         self._sync_minimap_layers(**state)
 
     def _sync_minimap_layers(self, **state):
-        if not hasattr(self, "minimap"):
+        if not self._minimap_ok():
             return
         self.minimap.map_view.apply_layer_state(**state)
 
     def _sync_minimap_map(self):
-        if not hasattr(self, "minimap"):
+        if not self._minimap_ok():
             return
         src = self.map_view
         mm = self.minimap.map_view
@@ -1003,7 +1029,7 @@ class MainWindow(QMainWindow):
 
     def on_minimap_size_changed(self, value: int):
         self.settings.setValue("minimap_size", int(value))
-        if hasattr(self, "minimap"):
+        if self._minimap_ok():
             self.minimap.set_size_px(int(value))
 
     def _minimap_focus_fraction(self) -> float:
@@ -1029,20 +1055,19 @@ class MainWindow(QMainWindow):
         self._refocus_minimap()
 
     def _refocus_minimap(self):
-        if not hasattr(self, "minimap"):
-            return
-        if not self.minimap.isVisible():
+        if not self._minimap_ok() or not self.minimap.isVisible():
             return
         mm = self.minimap.map_view
         if self._last_player:
             mm.set_player(self._last_player)
         mm.focus_around_player(self._minimap_focus_fraction())
-        # Ensure the overlay repaints after transform change
         mm.viewport().update()
         self.minimap.update()
 
     @Slot(str)
     def on_global_hotkey(self, key: str):
+        if not self._minimap_ok():
+            return
         if key == "f7":
             visible = self.minimap.toggle()
             if visible:
@@ -1191,7 +1216,7 @@ class MainWindow(QMainWindow):
         self._select_floor_for_y(state.y)
         self.map_view.set_player(state)
         self.map_view.center_on_player()
-        if hasattr(self, "minimap") and self.minimap.isVisible():
+        if self._minimap_ok() and self.minimap.isVisible():
             self.minimap.map_view.set_player(state)
             self.minimap.map_view.set_floor(self.map_view._floor)
             self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
@@ -1254,14 +1279,14 @@ class MainWindow(QMainWindow):
         self.btn_friend_join.setEnabled(True)
         self.friend_status_label.setText("Not in a room")
         self.map_view.set_friends([], self.current_map_slug)
-        if hasattr(self, "minimap"):
+        if self._minimap_ok():
             self.minimap.map_view.set_friends([], self.current_map_slug)
 
     @Slot(object)
     def on_friend_update(self, snaps):
         pings = list((snaps or {}).values())
         self.map_view.set_friends(pings, self.current_map_slug)
-        if hasattr(self, "minimap"):
+        if self._minimap_ok():
             self.minimap.map_view.set_friends(pings, self.current_map_slug)
         if self.friend_sync.room:
             n = self.friend_sync.live_count(self.current_map_slug)
@@ -1281,7 +1306,7 @@ class MainWindow(QMainWindow):
         snaps = self.friend_sync.friends_snapshot()
         pings = list(snaps.values())
         self.map_view.set_friends(pings, self.current_map_slug)
-        if hasattr(self, "minimap"):
+        if self._minimap_ok():
             self.minimap.map_view.set_friends(pings, self.current_map_slug)
 
     def choose_screenshot_dir(self):
@@ -1429,8 +1454,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
-            self.minimap.hide()
-            self.minimap.close()
+            if self._minimap_ok():
+                self.minimap.hide()
+                self.minimap.close()
         except Exception:
             pass
         try:
@@ -1593,15 +1619,29 @@ class MainWindow(QMainWindow):
             f"{note}"
         )
         self._refresh_friend_markers()
-        if hasattr(self, "minimap") and self.minimap.isVisible():
+        if self._minimap_ok() and self.minimap.isVisible():
             self._sync_minimap_map()
 
 
 def run():
-    app = QApplication(sys.argv)
-    app.setApplicationName("WMNavigation")
-    window = MainWindow()
-    window.resize(1400, 900)
-    window.setMinimumSize(480, 320)
-    window.show()
-    sys.exit(app.exec())
+    import traceback
+    from pathlib import Path
+
+    def _log_crash(text: str):
+        try:
+            path = Path.home() / "Desktop" / "WMNavigation_crash.log"
+            path.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+
+    try:
+        app = QApplication(sys.argv)
+        app.setApplicationName("WMNavigation")
+        window = MainWindow()
+        window.resize(1400, 900)
+        window.setMinimumSize(480, 320)
+        window.show()
+        sys.exit(app.exec())
+    except Exception:
+        _log_crash(traceback.format_exc())
+        raise
