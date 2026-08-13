@@ -46,22 +46,30 @@ def overlay_layer_ids(map_meta: dict | None) -> set[str]:
     return out
 
 
+def map_has_floor_art(map_meta: dict | None) -> bool:
+    """True if this map has extra SVG groups or tile sheets for other floors."""
+    for layer in (map_meta or {}).get("layers") or []:
+        if layer.get("svgLayer") or layer.get("tilePath"):
+            return True
+    return False
+
+
 def ground_layer_ids(map_meta: dict | None) -> set[str]:
     primary = str((map_meta or {}).get("svgLayer") or "Ground_Level")
     ids = aliases_for(primary)
     overlays = overlay_layer_ids(map_meta)
-    for extra in GROUND_EXTRAS:
-        if extra not in overlays:
-            ids |= aliases_for(extra)
+    # Only fold First_Floor into ground on maps that actually have upper overlays
+    # (Streets). Single-level maps like Lighthouse must stay Ground_Level only.
+    if overlays:
+        for extra in GROUND_EXTRAS:
+            if extra not in overlays:
+                ids |= aliases_for(extra)
     return ids
 
 
 def all_toggle_ids(map_meta: dict | None) -> set[str]:
-    ids = ground_layer_ids(map_meta) | overlay_layer_ids(map_meta)
-    for extra in LAYER_ALIASES.values():
-        ids.update(extra)
-    ids.update(LAYER_ALIASES.keys())
-    return ids
+    """Only groups that belong to THIS map — never a global alias dump."""
+    return ground_layer_ids(map_meta) | overlay_layer_ids(map_meta)
 
 
 def apply_svg_floor(

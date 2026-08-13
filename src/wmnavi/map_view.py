@@ -36,7 +36,7 @@ from .marker_icons import (
 )
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
 from .paths import cache_dir
-from .svg_layers import apply_svg_floor
+from .svg_layers import apply_svg_floor, map_has_floor_art
 from .tile_map import stitch_map_tiles
 
 
@@ -208,6 +208,15 @@ class MapView(QGraphicsView):
         self._map_slug = map_slug
         self._svg_source = svg_path
         self._applied_floor_key = ""
+        # Never keep the previous map's floor (would overlay Streets tiles on Lighthouse).
+        self._floor = FloorOption(
+            "All Floors",
+            -10000.0,
+            10000.0,
+            svg_layer=str((map_meta or {}).get("svgLayer") or ""),
+            tile_path=str((map_meta or {}).get("tilePath") or ""),
+            kind="all",
+        )
         if self._floor_tile_item:
             self.scene.removeItem(self._floor_tile_item)
             self._floor_tile_item = None
@@ -294,14 +303,26 @@ class MapView(QGraphicsView):
         self.scene.addItem(item)
         self.map_item = item
 
+    def _allowed_tile_paths(self) -> set[str]:
+        meta = self._map_meta or {}
+        allowed = {str(meta.get("tilePath") or "").strip()}
+        for layer in meta.get("layers") or []:
+            path = str(layer.get("tilePath") or "").strip()
+            if path:
+                allowed.add(path)
+        allowed.discard("")
+        return allowed
+
     def _set_floor_tiles(self, tile_path: str | None):
         if self._floor_tile_item:
             self.scene.removeItem(self._floor_tile_item)
             self._floor_tile_item = None
         if not tile_path or not self._map_meta or not self.crs_bounds:
             return
+        if tile_path not in self._allowed_tile_paths():
+            return
         main = str(self._map_meta.get("tilePath") or "")
-        if not tile_path or tile_path == main:
+        if tile_path == main:
             return
         tile_result = stitch_map_tiles(
             tile_path,
@@ -332,7 +353,9 @@ class MapView(QGraphicsView):
         self._applied_floor_key = key
         floor = self._floor
         source = self._svg_source
-        if source:
+        has_art = map_has_floor_art(self._map_meta)
+
+        if source and has_art:
             dest = (
                 cache_dir()
                 / "svg_floors"
@@ -349,7 +372,14 @@ class MapView(QGraphicsView):
                 self._replace_svg_item(str(dest))
             elif self.map_item is None:
                 self._replace_svg_item(source)
-        self._set_floor_tiles(floor.tile_path or None)
+        elif source and self.map_item is None:
+            self._replace_svg_item(source)
+
+        if has_art:
+            self._set_floor_tiles(floor.tile_path or None)
+        elif self._floor_tile_item:
+            self.scene.removeItem(self._floor_tile_item)
+            self._floor_tile_item = None
 
     def _in_map_bounds(self, mx: float, my: float) -> bool:
         if not self.crs_bounds:
