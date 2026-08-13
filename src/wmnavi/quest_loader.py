@@ -8,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from .models import MapPoint
-from .questie_source import questie_data_dir
+from .questie_source import find_map_entry, questie_data_dir
 
 # ground-zero-21 / tutorial share the same playable map as ground-zero.
 MAP_SLUG_ALIASES = {
@@ -227,13 +227,21 @@ def _task_has_work_on_map(task: dict, map_ids: set[str]) -> bool:
 
 
 def _task_has_anywhere_work(task: dict) -> bool:
-    """True if any objective is unbound to a specific map (any-map work)."""
+    """True if this quest is only unbound work (find/hand-in/build/skill).
+
+    Hybrid quests (Woods kill + hideout hand-in) must NOT appear under
+    Anywhere on a different map — they belong only on the maps they bind.
+    """
+    has_unbound = False
+    has_bound = False
     for obj in task.get("objectives") or []:
         if not isinstance(obj, dict):
             continue
-        if not _objective_map_ids(obj):
-            return True
-    return False
+        if _objective_map_ids(obj):
+            has_bound = True
+        else:
+            has_unbound = True
+    return has_unbound and not has_bound
 
 
 def _task_touches_map(task: dict, map_ids: set[str]) -> bool:
@@ -346,53 +354,190 @@ def _keys_for_map(task: dict, map_ids: set[str]) -> list[str]:
     return sorted(set(keys))
 
 
+def _spot_point(
+    *,
+    task_id: str,
+    obj_id: str,
+    idx: int,
+    x: float,
+    y: float,
+    z: float,
+    quest_name: str,
+    desc: str,
+    obj_type: str,
+    optional: bool,
+    requires_key: bool,
+) -> MapPoint:
+    return MapPoint(
+        id=f"{task_id}_{obj_id}_{idx}",
+        x=x,
+        y=y,
+        z=z,
+        label=quest_name,
+        kind="quest",
+        meta={
+            "quest_id": task_id,
+            "quest_name": quest_name,
+            "objective_id": obj_id,
+            "description": desc,
+            "type": obj_type,
+            "optional": optional,
+            "requires_key": requires_key,
+        },
+    )
+
+
+def _parse_pos(pos: dict | None) -> tuple[float, float, float] | None:
+    if not isinstance(pos, dict):
+        return None
+    try:
+        return float(pos.get("x", 0)), float(pos.get("y", 0)), float(pos.get("z", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_points_for_slug(mode: str, map_slug: str) -> list[tuple[str, float, float, float]]:
+    """(name, x, y, z) for extracts on this map from Questie dumps."""
+    entry = find_map_entry(mode, map_slug)
+    if not entry:
+        return []
+    from .questie_source import load_questie_labels, resolve_label
+
+    labels = load_questie_labels(mode)
+    pmc: list[tuple[str, float, float, float]] = []
+    other: list[tuple[str, float, float, float]] = []
+    for raw in entry.get("extracts") or []:
+        if not isinstance(raw, dict):
+            continue
+        parsed = _parse_pos(raw.get("position"))
+        if not parsed:
+            continue
+        name = resolve_label(labels, raw.get("name") or raw.get("id") or "Extract")
+        faction = str(raw.get("faction") or "").strip().lower()
+        row = (name, *parsed)
+        if faction in {"scav"}:
+            other.append(row)
+        else:
+            pmc.append(row)
+    return pmc or other
+
+
+def _norm_exit(text: str) -> str:
+    return "".join(ch for ch in (text or "").lower() if ch.isalnum())
+
+
+def _match_extracts(
+    exit_name: str | None,
+    extracts: list[tuple[str, float, float, float]],
+) -> list[tuple[str, float, float, float]]:
+    if not extracts:
+        return []
+    if not exit_name:
+        return extracts
+    needle = _norm_exit(exit_name)
+    hits = [e for e in extracts if needle and needle in _norm_exit(e[0])]
+    if hits:
+        return hits
+    # Common id-style names: Sandbox_VExit → vehicle / V-Ex
+    if "vexit" in needle or needle.endswith("vex"):
+        hits = [e for e in extracts if "v-ex" in e[0].lower() or "vex" in _norm_exit(e[0])]
+        if hits:
+            return hits
+    return extracts
+
+
 def _spots_for_task(
     task: dict,
     labels: dict[str, str],
     map_ids: set[str],
     quest_name: str,
     requires_key: bool,
+    *,
+    extracts: list[tuple[str, float, float, float]] | None = None,
 ) -> list[MapPoint]:
     spots: list[MapPoint] = []
+    seen: set[tuple[int, int, int]] = set()
+    extracts = extracts or []
+    tid = str(task.get("id") or "")
+
+    def add_spot(obj: dict, idx: int, x: float, y: float, z: float, desc: str | None = None):
+        key = (round(x * 10), round(y * 10), round(z * 10))
+        if key in seen:
+            return
+        seen.add(key)
+        obj_id = obj.get("id") or ""
+        obj_type = obj.get("type") or ""
+        spots.append(
+            _spot_point(
+                task_id=tid,
+                obj_id=str(obj_id),
+                idx=idx,
+                x=x,
+                y=y,
+                z=z,
+                quest_name=quest_name,
+                desc=desc
+                or _label(labels, obj.get("description") or "", obj_type or "Objective"),
+                obj_type=obj_type,
+                optional=bool(obj.get("optional")),
+                requires_key=requires_key,
+            )
+        )
+
     for obj in task.get("objectives") or []:
         if not isinstance(obj, dict):
             continue
+        if not (_objective_map_ids(obj) & map_ids):
+            continue
         desc = _label(labels, obj.get("description") or "", obj.get("type") or "Objective")
-        obj_id = obj.get("id") or ""
-        obj_type = obj.get("type") or ""
-        zones = obj.get("zones") or []
-        for idx, zone in enumerate(zones):
+        n_before = len(spots)
+
+        for idx, zone in enumerate(obj.get("zones") or []):
             if not isinstance(zone, dict):
                 continue
-            zm = zone.get("map")
-            if zm and str(zm) not in map_ids:
+            zm = _as_map_id(zone.get("map"))
+            if zm and zm not in map_ids:
                 continue
-            pos = zone.get("position") or {}
-            try:
-                x = float(pos.get("x", 0))
-                y = float(pos.get("y", 0))
-                z = float(pos.get("z", 0))
-            except (TypeError, ValueError):
+            parsed = _parse_pos(zone.get("position"))
+            if parsed:
+                add_spot(obj, idx, *parsed, desc)
+
+        for loc in obj.get("possibleLocations") or []:
+            if not isinstance(loc, dict):
                 continue
-            spots.append(
-                MapPoint(
-                    id=f"{task.get('id')}_{obj_id}_{idx}",
-                    x=x,
-                    y=y,
-                    z=z,
-                    label=quest_name,
-                    kind="quest",
-                    meta={
-                        "quest_id": task.get("id") or "",
-                        "quest_name": quest_name,
-                        "objective_id": obj_id,
-                        "description": desc,
-                        "type": obj_type,
-                        "optional": bool(obj.get("optional")),
-                        "requires_key": requires_key,
-                    },
+            zm = _as_map_id(loc.get("map") or loc.get("id"))
+            if zm and zm not in map_ids:
+                continue
+            positions = list(loc.get("positions") or [])
+            if isinstance(loc.get("position"), dict):
+                positions.insert(0, loc["position"])
+            for idx, pos in enumerate(positions):
+                parsed = _parse_pos(pos if isinstance(pos, dict) else None)
+                if parsed:
+                    add_spot(obj, 1000 + idx, *parsed, desc)
+
+        parsed = _parse_pos(obj.get("position") if isinstance(obj.get("position"), dict) else None)
+        if parsed:
+            add_spot(obj, 2000, *parsed, desc)
+
+        obj_type = (obj.get("type") or "").lower()
+        if len(spots) == n_before and extracts:
+            if obj_type == "extract":
+                matched = _match_extracts(obj.get("exitName"), extracts)
+                for idx, (ename, x, y, z) in enumerate(matched):
+                    add_spot(obj, 3000 + idx, x, y, z, desc=f"{desc} — {ename}")
+            else:
+                # Map-wide (kills, visit without coords): one pin so the quest is findable.
+                ename, x, y, z = extracts[0]
+                add_spot(
+                    obj,
+                    4000,
+                    x,
+                    y,
+                    z,
+                    desc=f"{desc} — anywhere on this map",
                 )
-            )
+
     return spots
 
 
@@ -417,6 +562,7 @@ def load_quests_for_map(map_slug: str, mode: str = "regular") -> list[QuestInfo]
         return []
 
     traders_labels = _traders_labels(mode)
+    extracts = _extract_points_for_slug(mode, map_slug)
 
     out: list[QuestInfo] = []
     for task in tasks:
@@ -433,6 +579,7 @@ def load_quests_for_map(map_slug: str, mode: str = "regular") -> list[QuestInfo]
                 item_labels=item_labels,
                 map_labels=map_labels,
                 id_to_slug=id_to_slug,
+                extracts=extracts,
             )
         )
 
@@ -472,6 +619,7 @@ def _build_quest_info(
     item_labels: dict[str, str] | None = None,
     map_labels: dict[str, str] | None = None,
     id_to_slug: dict[str, str] | None = None,
+    extracts: list[tuple[str, float, float, float]] | None = None,
 ) -> QuestInfo:
     tid = task.get("id") or ""
     name = _label(labels, task.get("name") or "", tid)
@@ -497,7 +645,11 @@ def _build_quest_info(
     if isinstance(trader_id, dict):
         trader_id = trader_id.get("id") or ""
     trader_name = _trader_name(traders_labels, trader_id)
-    spots = _spots_for_task(task, labels, map_ids, name, requires_key) if map_ids else []
+    spots = (
+        _spots_for_task(task, labels, map_ids, name, requires_key, extracts=extracts)
+        if map_ids
+        else []
+    )
     on_map = bool(map_ids) and _task_has_work_on_map(task, map_ids)
     req = _requirements_text(
         task,
@@ -551,6 +703,7 @@ def load_quests_split(
     id_to_slug = _map_id_to_slug(mode)
     traders = _traders_labels(mode)
     map_ids = _map_ids_for_slug(mode, map_slug)
+    extracts = _extract_points_for_slug(mode, map_slug) if map_ids else []
     on_map: list[QuestInfo] = []
     anywhere: list[QuestInfo] = []
 
@@ -576,6 +729,7 @@ def load_quests_split(
                 item_labels=item_labels,
                 map_labels=map_labels,
                 id_to_slug=id_to_slug,
+                extracts=extracts,
             )
             info.on_map = True
             on_map.append(info)
@@ -591,6 +745,7 @@ def load_quests_split(
                 item_labels=item_labels,
                 map_labels=map_labels,
                 id_to_slug=id_to_slug,
+                extracts=extracts,
             )
             info.on_map = True
             on_map.append(info)

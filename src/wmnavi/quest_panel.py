@@ -71,7 +71,7 @@ class QuestListPanel(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Active Quests")
-        self.setMinimumSize(520, 640)
+        self.setMinimumSize(360, 280)
         self._checks: dict[str, QCheckBox] = {}
 
         root = QVBoxLayout(self)
@@ -166,8 +166,13 @@ class QuestListPanel(QDialog):
         for quest in quests:
             row = QHBoxLayout()
             prefix = "K · " if quest.requires_key else ""
-            label = f"{prefix}{quest.name}"
+            pin = f" · {len(quest.spots)} pin(s)" if quest.spots else " · no map pin"
+            label = f"{prefix}{quest.name}{pin}"
             tip = (quest.requirements_text or "").strip() or "No objective details available."
+            if quest.spots:
+                tip = f"{len(quest.spots)} location(s) on this map.\n\n{tip}"
+            else:
+                tip = f"No coordinate pin for this map.\n\n{tip}"
             if checkable:
                 box = QCheckBox(label)
                 box.setChecked(quest.id in active_ids)

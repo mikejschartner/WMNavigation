@@ -53,7 +53,7 @@ class MapLayersSidebar(QScrollArea):
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(80)
         self._host = QWidget()
         self._layout = QVBoxLayout(self._host)
         self._layout.setContentsMargins(8, 8, 8, 8)

@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSlider,
+    QSpinBox,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -62,6 +64,7 @@ from .profile_link import (
 from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
 from .theme import STYLESHEET
+from .win_input import press_v_in_raid
 
 
 class ScreenshotHandler(FileSystemEventHandler):
@@ -106,6 +109,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"WMNavigation v{__version__}")
+        self.setMinimumSize(480, 320)
         icon_path = app_root() / "assets" / "icon.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -140,6 +144,7 @@ class MainWindow(QMainWindow):
             self._quest_log_states[self.current_game_mode] = cached
             self.player_active_quest_ids = cached.active_ids()
         self.raid_started_at: datetime | None = None
+        self.in_raid = False
         saved_shot = Path(self.settings.value("screenshot_dir", ""))
         if saved_shot and saved_shot.is_dir():
             self.screenshot_dir = saved_shot
@@ -155,6 +160,8 @@ class MainWindow(QMainWindow):
         self._screenshot_poll = QTimer(self)
         self._screenshot_poll.setInterval(750)
         self._screenshot_poll.timeout.connect(self._poll_screenshots)
+        self._live_timer = QTimer(self)
+        self._live_timer.timeout.connect(self._on_live_tick)
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
@@ -172,7 +179,8 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(340)
+        sidebar.setMinimumWidth(180)
+        sidebar.setMaximumWidth(520)
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(12, 10, 12, 10)
         side_layout.setSpacing(6)
@@ -208,7 +216,7 @@ class MainWindow(QMainWindow):
 
         self.layer_sidebar = MapLayersSidebar()
         self.layer_sidebar.changed.connect(self.on_layers_changed)
-        self.layer_sidebar.setMinimumHeight(280)
+        self.layer_sidebar.setMinimumHeight(80)
         side_layout.addWidget(self.layer_sidebar, 3)
 
         # Compact bottom controls so the layers list keeps most of the height.
@@ -297,6 +305,23 @@ class MainWindow(QMainWindow):
         self.chk_autodelete.stateChanged.connect(self.on_autodelete_toggle)
         bottom_layout.addWidget(self.chk_autodelete)
 
+        live_row = QHBoxLayout()
+        self.chk_live = QCheckBox("Continuous mode")
+        self.chk_live.setToolTip(
+            "While in raid, press V every N seconds for a live map track. Stops when you extract."
+        )
+        self.chk_live.setChecked(self.settings.value("live_mode", False, type=bool))
+        self.chk_live.stateChanged.connect(self.on_live_mode_changed)
+        live_row.addWidget(self.chk_live, 1)
+        self.live_interval = QSpinBox()
+        self.live_interval.setRange(2, 60)
+        self.live_interval.setSuffix(" s")
+        self.live_interval.setValue(int(self.settings.value("live_interval", 5)))
+        self.live_interval.setToolTip("Seconds between automatic V screenshots")
+        self.live_interval.valueChanged.connect(self.on_live_interval_changed)
+        live_row.addWidget(self.live_interval)
+        bottom_layout.addLayout(live_row)
+
         bottom_layout.addWidget(QLabel("Tarkov screenshots (press V in-raid)"))
         self.screenshot_path_label = QLabel(str(self.screenshot_dir))
         self.screenshot_path_label.setObjectName("status")
@@ -323,8 +348,7 @@ class MainWindow(QMainWindow):
         bottom_scroll.setFrameShape(QFrame.Shape.NoFrame)
         bottom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         bottom_scroll.setWidget(bottom)
-        bottom_scroll.setMinimumHeight(220)
-        bottom_scroll.setMaximumHeight(360)
+        bottom_scroll.setMinimumHeight(80)
         side_layout.addWidget(bottom_scroll, 2)
 
         map_host = QWidget()
@@ -338,13 +362,13 @@ class MainWindow(QMainWindow):
         top_row.setContentsMargins(10, 8, 10, 8)
         top_row.addWidget(QLabel("Floor"))
         self.floor_combo = QComboBox()
-        self.floor_combo.setMinimumWidth(120)
+        self.floor_combo.setMinimumWidth(80)
         self.floor_combo.currentIndexChanged.connect(self.on_floor_changed)
         top_row.addWidget(self.floor_combo)
 
         top_row.addWidget(QLabel("Quests"))
         self.quest_btn = QPushButton("None active")
-        self.quest_btn.setMinimumWidth(160)
+        self.quest_btn.setMinimumWidth(80)
         self.quest_btn.setToolTip("Open active quests grouped by trader")
         self.quest_btn.clicked.connect(self.open_quest_panel)
         top_row.addWidget(self.quest_btn)
@@ -372,11 +396,18 @@ class MainWindow(QMainWindow):
         self.map_view.set_marker_scale(float(self.settings.value("marker_scale", 0.85)))
         map_layout.addWidget(self.map_view, 1)
 
-        layout.addWidget(sidebar)
-        layout.addWidget(map_host, 1)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+        splitter.addWidget(sidebar)
+        splitter.addWidget(map_host)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setChildrenCollapsible(True)
+        splitter.setSizes([280, 1100])
 
         self._set_mode_combo(self.current_game_mode)
         self.on_topmost()
+        self._sync_live_timer()
         self._select_map_combo(self.current_map_slug)
         self._update_price_labels()
         QTimer.singleShot(1500, self.check_for_updates)
@@ -1016,13 +1047,17 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def on_auto_map(self, slug: str):
         self.raid_started_at = datetime.now()
+        self.in_raid = True
         if slug != self.current_map_slug:
             self.load_map(slug)
             self._select_map_combo(slug)
         self.status_label.setText(f"Raid detected → {slug.replace('-', ' ').title()}")
+        self._sync_live_timer()
 
     @Slot()
     def on_raid_end(self):
+        self.in_raid = False
+        self._live_timer.stop()
         self.status_label.setText("Raid ended")
         if self.auto_delete:
             self.delete_raid_screenshots()
@@ -1212,6 +1247,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._screenshot_poll.stop()
+        self._live_timer.stop()
         if hasattr(self, "observer") and self.observer:
             self.observer.stop()
             self.observer.join(timeout=2)
@@ -1239,6 +1275,43 @@ class MainWindow(QMainWindow):
     def on_autodelete_toggle(self):
         self.auto_delete = self.chk_autodelete.isChecked()
         self.settings.setValue("auto_delete_screenshots", self.auto_delete)
+
+    def on_live_mode_changed(self):
+        self.settings.setValue("live_mode", self.chk_live.isChecked())
+        self._sync_live_timer()
+        if self.chk_live.isChecked():
+            if self.in_raid:
+                self.status_label.setText(
+                    f"Continuous mode on · V every {self.live_interval.value()}s while in raid"
+                )
+            else:
+                self.status_label.setText("Continuous mode on · waiting for raid")
+        else:
+            self.status_label.setText("Continuous mode off")
+
+    def on_live_interval_changed(self, value: int):
+        self.settings.setValue("live_interval", int(value))
+        self._sync_live_timer()
+
+    def _sync_live_timer(self):
+        if not hasattr(self, "chk_live"):
+            return
+        interval_ms = max(2, int(self.live_interval.value())) * 1000
+        self._live_timer.setInterval(interval_ms)
+        if self.chk_live.isChecked() and self.in_raid:
+            if not self._live_timer.isActive():
+                self._live_timer.start()
+                self._on_live_tick()
+        else:
+            self._live_timer.stop()
+
+    def _on_live_tick(self):
+        if not self.chk_live.isChecked() or not self.in_raid:
+            self._live_timer.stop()
+            return
+        if press_v_in_raid():
+            return
+        self.status_label.setText("Continuous mode · Tarkov window not found")
 
     def center_player(self):
         self.map_view.center_on_player()
@@ -1340,5 +1413,6 @@ def run():
     app.setApplicationName("WMNavigation")
     window = MainWindow()
     window.resize(1400, 900)
+    window.setMinimumSize(480, 320)
     window.show()
     sys.exit(app.exec())

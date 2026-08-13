@@ -52,7 +52,7 @@ class LayerVisibility:
 
 
 class PlayerMarker(QGraphicsPixmapItem):
-    """Precision marker — black dot = position, red arrow = look direction."""
+    """Precision marker — green dot = position, green arrow = look direction."""
 
     def __init__(self, size_px: float = 28):
         pix = load_player_marker_pixmap(size_px)

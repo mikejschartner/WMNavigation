@@ -246,24 +246,24 @@ def get_location_pin(color: str = "#c084fc", size: float = 8) -> QPixmap:
 
 
 def load_player_marker_pixmap(size: float = 28) -> QPixmap:
-    """Precision player marker: small black position dot + red facing arrow."""
+    """Precision player marker: bright green position dot + green facing arrow."""
     from PySide6.QtCore import QPointF
     from PySide6.QtGui import QPolygonF
 
-    # Keep canvas compact so the black dot stays near true map position.
+    # Keep canvas compact so the green dot stays near true map position.
     size_i = max(18, int(round(size)))
-    cache = _cache_key("player", "dot_arrow_v2", size_i)
+    cache = _cache_key("player", "dot_arrow_green_v1", size_i)
     if cache in _ICON_CACHE:
         return _ICON_CACHE[cache]
 
     def draw(painter: QPainter, sz: int):
         cx = cy = sz / 2.0
-        # Red facing arrow (points up / north before rotation).
+        green = QColor("#22ff55")
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setPen(
             QPen(
-                QColor("#dc2626"),
-                max(1.5, sz * 0.08),
+                green,
+                max(2.0, sz * 0.10),
                 Qt.PenStyle.SolidLine,
                 Qt.PenCapStyle.RoundCap,
                 Qt.PenJoinStyle.RoundJoin,
@@ -272,20 +272,20 @@ def load_player_marker_pixmap(size: float = 28) -> QPixmap:
         tip_y = sz * 0.08
         painter.drawLine(QPointF(cx, cy), QPointF(cx, tip_y + sz * 0.12))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#dc2626"))
+        painter.setBrush(green)
         tip = QPolygonF(
             [
                 QPointF(cx, tip_y),
-                QPointF(cx - sz * 0.14, tip_y + sz * 0.22),
-                QPointF(cx + sz * 0.14, tip_y + sz * 0.22),
+                QPointF(cx - sz * 0.16, tip_y + sz * 0.24),
+                QPointF(cx + sz * 0.16, tip_y + sz * 0.24),
             ]
         )
         painter.drawPolygon(tip)
 
-        # Black feet/position dot centered on true coordinates.
-        dot = max(3, int(round(sz * 0.22)))
-        painter.setBrush(QColor("#0a0a0a"))
-        painter.setPen(QPen(QColor("#f5f5f5"), max(1, sz // 18)))
+        # Bright green feet/position dot centered on true coordinates.
+        dot = max(4, int(round(sz * 0.28)))
+        painter.setBrush(green)
+        painter.setPen(QPen(QColor("#052e16"), max(1, sz // 16)))
         painter.drawEllipse(int(cx - dot / 2), int(cy - dot / 2), dot, dot)
 
     pix = _draw_pixmap(size_i, draw)
