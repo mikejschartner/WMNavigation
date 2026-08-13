@@ -6,7 +6,7 @@ Numbering matches Tarkov:
   Floor 2+ = upper floors
 
 Each Y belongs to exactly one floor so auto-select changes when you
-go from 2nd to 3rd.
+go from 2nd to 3rd. svg_layer / tile_path drive the visible map plan.
 """
 
 from __future__ import annotations
@@ -19,6 +19,9 @@ class FloorOption:
     label: str
     min_y: float
     max_y: float
+    svg_layer: str = ""
+    tile_path: str = ""
+    kind: str = "main"  # all | underground | main | upper
 
 
 def _primary_extent(extents: list[dict]) -> tuple[float, float] | None:
@@ -46,56 +49,106 @@ def _is_underground_name(name: str) -> bool:
 
 
 def build_floor_options(map_meta: dict | None) -> list[FloorOption]:
-    options = [FloorOption("All Floors", -10000.0, 10000.0)]
+    ground_svg = str((map_meta or {}).get("svgLayer") or "")
+    ground_tiles = str((map_meta or {}).get("tilePath") or "")
+    options = [
+        FloorOption(
+            "All Floors",
+            -10000.0,
+            10000.0,
+            svg_layer=ground_svg,
+            tile_path=ground_tiles,
+            kind="all",
+        )
+    ]
     if not map_meta:
-        options.append(FloorOption("Floor 1 (Main)", -10000.0, 10000.0))
+        options.append(FloorOption("Floor 1 (Main)", -10000.0, 10000.0, kind="main"))
         return options
 
-    underground: list[tuple[str, float, float]] = []
-    uppers: list[tuple[str, float, float]] = []
+    underground: list[tuple[str, float, float, str, str]] = []
+    uppers: list[tuple[str, float, float, str, str]] = []
     for layer in map_meta.get("layers") or []:
         name = str(layer.get("name") or "Floor")
         span = _primary_extent(layer.get("extents") or [])
         if not span:
             continue
         low, high = span
+        svg = str(layer.get("svgLayer") or "")
+        tiles = str(layer.get("tilePath") or "")
+        row = (name, low, high, svg, tiles)
         if _is_underground_name(name):
-            underground.append((name, low, high))
+            underground.append(row)
         else:
-            uppers.append((name, low, high))
+            uppers.append(row)
 
     uppers.sort(key=lambda b: b[1])
 
     ug_high = -10000.0
     if underground:
-        ug_name = underground[0][0]
+        ug_name, _lo, ug_high, ug_svg, ug_tiles = underground[0]
         ug_high = max(b[2] for b in underground)
         if uppers and uppers[0][1] < ug_high:
             ug_high = uppers[0][1]
         extra = ug_name if ug_name.lower() not in {"underground", "basement"} else ""
         label = f"Floor 0 ({extra})" if extra else "Floor 0 (Underground)"
-        options.append(FloorOption(label, -10000.0, ug_high))
+        options.append(
+            FloorOption(
+                label,
+                -10000.0,
+                ug_high,
+                svg_layer=ug_svg or underground[0][3],
+                tile_path=ug_tiles or underground[0][4],
+                kind="underground",
+            )
+        )
 
     start_n = 2
     main_low = ug_high if underground else -10000.0
     if uppers and (uppers[0][1] - main_low) > 0.2:
-        options.append(FloorOption("Floor 1 (Main)", main_low, uppers[0][1]))
+        options.append(
+            FloorOption(
+                "Floor 1 (Main)",
+                main_low,
+                uppers[0][1],
+                svg_layer=ground_svg,
+                tile_path=ground_tiles,
+                kind="main",
+            )
+        )
         start_n = 2
     elif not uppers:
-        options.append(FloorOption("Floor 1 (Main)", main_low, 10000.0))
+        options.append(
+            FloorOption(
+                "Floor 1 (Main)",
+                main_low,
+                10000.0,
+                svg_layer=ground_svg,
+                tile_path=ground_tiles,
+                kind="main",
+            )
+        )
         return options
     else:
-        # First listed upper sits on the underground boundary — treat it as main.
         start_n = 1
 
-    for i, (_name, low, _high) in enumerate(uppers):
+    for i, (_name, low, _high, svg, tiles) in enumerate(uppers):
         n = start_n + i
         band_low = low if i else options[-1].max_y
         band_high = uppers[i + 1][1] if i + 1 < len(uppers) else 10000.0
         if band_high <= band_low:
             continue
         label = "Floor 1 (Main)" if n == 1 else f"Floor {n}"
-        options.append(FloorOption(label, band_low, band_high))
+        kind = "main" if n == 1 else "upper"
+        options.append(
+            FloorOption(
+                label,
+                band_low,
+                band_high,
+                svg_layer=svg if kind == "upper" else (svg or ground_svg),
+                tile_path=tiles if kind == "upper" else (tiles or ground_tiles),
+                kind=kind,
+            )
+        )
 
     return options
 

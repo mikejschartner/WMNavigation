@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QTransform, QWheelEvent
@@ -34,6 +35,8 @@ from .marker_icons import (
     load_player_marker_pixmap,
 )
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
+from .paths import cache_dir
+from .svg_layers import apply_svg_floor
 from .tile_map import stitch_map_tiles
 
 
@@ -122,6 +125,11 @@ class MapView(QGraphicsView):
         self.setScene(self.scene)
         self.map_item: QGraphicsSvgItem | None = None
         self._tile_item: QGraphicsPixmapItem | None = None
+        self._floor_tile_item: QGraphicsPixmapItem | None = None
+        self._svg_source: str | None = None
+        self._map_meta: dict | None = None
+        self._map_slug = "map"
+        self._applied_floor_key = ""
         self._map_unit = 6.0
         self.map_rotation = 0
         self.map_transform: list[float] | None = None
@@ -180,6 +188,7 @@ class MapView(QGraphicsView):
 
     def set_floor(self, floor: FloorOption):
         self._floor = floor
+        self._apply_floor_visual()
         self.refresh_layers()
 
     def load_svg(
@@ -195,6 +204,13 @@ class MapView(QGraphicsView):
         self.map_transform = transform
         self.map_bounds = bounds
         self.bounds = bounds
+        self._map_meta = map_meta
+        self._map_slug = map_slug
+        self._svg_source = svg_path
+        self._applied_floor_key = ""
+        if self._floor_tile_item:
+            self.scene.removeItem(self._floor_tile_item)
+            self._floor_tile_item = None
         if self._tile_item:
             self.scene.removeItem(self._tile_item)
             self._tile_item = None
@@ -250,7 +266,90 @@ class MapView(QGraphicsView):
         self._update_map_unit()
         self.resetTransform()
         self.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._apply_floor_visual()
         self.refresh_layers()
+
+    def _floor_cache_key(self) -> str:
+        floor = self._floor
+        return f"{self._map_slug}|{floor.label}|{floor.svg_layer}|{floor.kind}"
+
+    def _replace_svg_item(self, path: str):
+        """Swap the SVG graphic without resetting pan/zoom."""
+        old = self.map_item
+        item = QGraphicsSvgItem(path)
+        item.setZValue(0)
+        item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+        if old is not None:
+            item.setTransform(old.transform())
+            item.setPos(old.pos())
+            if old.scene():
+                self.scene.removeItem(old)
+        elif self.crs_bounds:
+            min_x, max_x, min_y, max_y = self.crs_bounds
+            svg_rect = item.boundingRect()
+            sx = (max_x - min_x) / svg_rect.width() if svg_rect.width() else 1.0
+            sy = (max_y - min_y) / svg_rect.height() if svg_rect.height() else 1.0
+            item.setTransform(QTransform.fromScale(sx, sy))
+            item.setPos(min_x, min_y)
+        self.scene.addItem(item)
+        self.map_item = item
+
+    def _set_floor_tiles(self, tile_path: str | None):
+        if self._floor_tile_item:
+            self.scene.removeItem(self._floor_tile_item)
+            self._floor_tile_item = None
+        if not tile_path or not self._map_meta or not self.crs_bounds:
+            return
+        main = str(self._map_meta.get("tilePath") or "")
+        if not tile_path or tile_path == main:
+            return
+        tile_result = stitch_map_tiles(
+            tile_path,
+            self.crs_bounds,
+            min_zoom=int(self._map_meta.get("minZoom") or 2),
+            max_zoom=int(self._map_meta.get("maxZoom") or 6),
+            tile_size=int(self._map_meta.get("tileSize") or 256),
+            map_slug=f"{self._map_slug}_{self._floor.kind}_{self._floor.svg_layer or 'floor'}",
+        )
+        if not tile_result:
+            return
+        pix, (px, py, pw, ph) = tile_result
+        item = QGraphicsPixmapItem(pix)
+        item.setZValue(1)
+        item.setPos(px, py)
+        sx = pw / pix.width() if pix.width() else 1.0
+        sy = ph / pix.height() if pix.height() else 1.0
+        item.setTransform(QTransform.fromScale(sx, sy))
+        item.setOpacity(0.92)
+        self.scene.addItem(item)
+        self._floor_tile_item = item
+
+    def _apply_floor_visual(self):
+        """Toggle SVG floor groups (and optional tile overlays) for the active floor."""
+        key = self._floor_cache_key()
+        if key == self._applied_floor_key and self.map_item is not None:
+            return
+        self._applied_floor_key = key
+        floor = self._floor
+        source = self._svg_source
+        if source:
+            dest = (
+                cache_dir()
+                / "svg_floors"
+                / f"{self._map_slug}_{floor.kind}_{floor.svg_layer or 'ground'}.svg"
+            )
+            ok = apply_svg_floor(
+                Path(source),
+                dest,
+                map_meta=self._map_meta,
+                active_layer=floor.svg_layer,
+                kind=floor.kind,
+            )
+            if ok and dest.exists():
+                self._replace_svg_item(str(dest))
+            elif self.map_item is None:
+                self._replace_svg_item(source)
+        self._set_floor_tiles(floor.tile_path or None)
 
     def _in_map_bounds(self, mx: float, my: float) -> bool:
         if not self.crs_bounds:
