@@ -349,6 +349,16 @@ class MainWindow(QMainWindow):
         self.minimap_size.setToolTip("Size of the F7 overlay on your main monitor")
         self.minimap_size.valueChanged.connect(self.on_minimap_size_changed)
         bottom_layout.addWidget(self.minimap_size)
+        bottom_layout.addWidget(QLabel("Mini map zoom"))
+        self.minimap_zoom = QSlider(Qt.Orientation.Horizontal)
+        self.minimap_zoom.setRange(1, 10)
+        self.minimap_zoom.setValue(int(self.settings.value("minimap_zoom", 5)))
+        self.minimap_zoom.setToolTip("1 = wide area · 10 = zoomed in close on you")
+        self.minimap_zoom.valueChanged.connect(self.on_minimap_zoom_changed)
+        bottom_layout.addWidget(self.minimap_zoom)
+        self.minimap_zoom_label = QLabel()
+        bottom_layout.addWidget(self.minimap_zoom_label)
+        self._update_minimap_zoom_label()
 
         bottom_layout.addWidget(QLabel("Friend raid share"))
         self.friend_name_edit = QLineEdit()
@@ -692,7 +702,7 @@ class MainWindow(QMainWindow):
             if hasattr(self, "minimap"):
                 self.minimap.map_view.set_floor(floor)
                 if self.minimap.isVisible() and self._last_player:
-                    self.minimap.map_view.focus_around_player()
+                    self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
 
     def _quest_settings_key(self) -> str:
         return f"active_quests/{self.current_game_mode}/{self.current_map_slug}"
@@ -987,7 +997,7 @@ class MainWindow(QMainWindow):
         )
         if self._last_player:
             mm.set_player(self._last_player)
-            mm.focus_around_player()
+            mm.focus_around_player(self._minimap_focus_fraction())
         snaps = self.friend_sync.friends_snapshot() if self.friend_sync.room else {}
         mm.set_friends(list(snaps.values()), self.current_map_slug)
 
@@ -996,15 +1006,42 @@ class MainWindow(QMainWindow):
         if hasattr(self, "minimap"):
             self.minimap.set_size_px(int(value))
 
+    def _minimap_focus_fraction(self) -> float:
+        """Slider 1–10 → map span fraction (lower = more zoomed in)."""
+        level = int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 5
+        level = max(1, min(10, level))
+        # 1 → ~0.28 (wide), 10 → ~0.05 (tight)
+        return 0.28 - (level - 1) / 9.0 * 0.23
+
+    def _update_minimap_zoom_label(self):
+        level = int(self.minimap_zoom.value())
+        if level <= 3:
+            tip = "wide"
+        elif level <= 7:
+            tip = "medium"
+        else:
+            tip = "close"
+        self.minimap_zoom_label.setText(f"Zoom {level}/10 · {tip}")
+
+    def on_minimap_zoom_changed(self, value: int):
+        self.settings.setValue("minimap_zoom", int(value))
+        self._update_minimap_zoom_label()
+        self._refocus_minimap()
+
+    def _refocus_minimap(self):
+        if not hasattr(self, "minimap") or not self.minimap.isVisible():
+            return
+        if self._last_player:
+            self.minimap.map_view.set_player(self._last_player)
+        self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
+
     @Slot(str)
     def on_global_hotkey(self, key: str):
         if key == "f7":
             visible = self.minimap.toggle()
             if visible:
                 self._sync_minimap_map()
-                if self._last_player:
-                    self.minimap.map_view.set_player(self._last_player)
-                    self.minimap.map_view.focus_around_player()
+                self._refocus_minimap()
                 pct = int(self.minimap.opacity_tier() * 100)
                 self.status_label.setText(f"Mini map on · {pct}% opacity (F8 to cycle)")
             else:
@@ -1151,7 +1188,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "minimap") and self.minimap.isVisible():
             self.minimap.map_view.set_player(state)
             self.minimap.map_view.set_floor(self.map_view._floor)
-            self.minimap.map_view.focus_around_player()
+            self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
         floor_label = self.floor_combo.currentText()
         self.status_label.setText(
             f"Position locked · X {state.x:.1f}  Y {state.y:.1f}  Z {state.z:.1f}  "
