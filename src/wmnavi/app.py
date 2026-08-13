@@ -177,38 +177,38 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
-        try:
-            self.minimap = MiniMapWindow(size_px=int(self.settings.value("minimap_size", 300) or 300))
-        except Exception:
-            self.minimap = None
+        # Create minimap lazily on first F7 — avoids extra startup work/crashes.
+        self.minimap = None
         self.hotkeys = GlobalHotkeys(self)
         self.hotkeys.pressed.connect(self.on_global_hotkey)
-        self.load_map(self.current_map_slug)
-        self.start_watchers()
+        try:
+            self.load_map(self.current_map_slug)
+        except Exception as exc:
+            self.status_label.setText(f"Map load failed: {exc}")
+        try:
+            self.start_watchers()
+        except Exception:
+            pass
         self._friend_prune_timer.start()
-        # Hotkeys need a real HWND — register after first show.
-        QTimer.singleShot(0, self._start_global_hotkeys)
+        QTimer.singleShot(300, self._start_global_hotkeys)
 
     def _start_global_hotkeys(self):
         try:
-            # Ensure Win32 handle exists
-            self.winId()
-            hwnd = int(self.winId())
-            ok = self.hotkeys.start(hwnd)
-            if not ok:
-                # One more try after the window is fully mapped
-                QTimer.singleShot(500, self._retry_global_hotkeys)
+            self.hotkeys.start()
         except Exception:
             pass
 
-    def _retry_global_hotkeys(self):
+    def _ensure_minimap(self) -> bool:
+        if self.minimap is not None:
+            return True
         try:
-            hwnd = int(self.winId())
-            if self.hotkeys.start(hwnd):
-                return
-            self.status_label.setText("Mini map hotkeys unavailable (F7/F8 already in use)")
-        except Exception:
-            pass
+            size = int(self.settings.value("minimap_size", 300) or 300)
+            self.minimap = MiniMapWindow(size_px=size)
+            return True
+        except Exception as exc:
+            self.status_label.setText(f"Mini map failed: {exc}")
+            self.minimap = None
+            return False
 
     def _layer_settings_prefix(self) -> str:
         return f"layers/{self.current_game_mode}/{self.current_map_slug}"
@@ -1066,9 +1066,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def on_global_hotkey(self, key: str):
-        if not self._minimap_ok():
-            return
         if key == "f7":
+            if not self._ensure_minimap():
+                return
             visible = self.minimap.toggle()
             if visible:
                 self._sync_minimap_map()
@@ -1078,7 +1078,7 @@ class MainWindow(QMainWindow):
             else:
                 self.status_label.setText("Mini map off (F7)")
         elif key == "f8":
-            if not self.minimap.isVisible():
+            if not self._minimap_ok() or not self.minimap.isVisible():
                 return
             self.minimap.cycle_opacity()
             pct = int(self.minimap.opacity_tier() * 100)
@@ -1624,13 +1624,28 @@ class MainWindow(QMainWindow):
 
 
 def run():
+    import faulthandler
     import traceback
     from pathlib import Path
 
+    crash_path = Path.home() / "Desktop" / "WMNavigation_crash.log"
+    # OneDrive Desktop fallback
+    desk2 = Path.home() / "OneDrive" / "Desktop" / "WMNavigation_crash.log"
+
     def _log_crash(text: str):
+        for path in (crash_path, desk2):
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            except Exception:
+                pass
+
+    try:
+        fault_file = (crash_path if crash_path.parent.exists() else desk2).open("a", encoding="utf-8")
+        faulthandler.enable(file=fault_file, all_threads=True)
+    except Exception:
         try:
-            path = Path.home() / "Desktop" / "WMNavigation_crash.log"
-            path.write_text(text, encoding="utf-8")
+            faulthandler.enable(all_threads=True)
         except Exception:
             pass
 
