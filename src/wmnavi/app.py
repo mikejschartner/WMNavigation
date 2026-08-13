@@ -1010,8 +1010,8 @@ class MainWindow(QMainWindow):
         """Slider 1–10 → map span fraction (lower = more zoomed in)."""
         level = int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 5
         level = max(1, min(10, level))
-        # 1 → ~0.28 (wide), 10 → ~0.05 (tight)
-        return 0.28 - (level - 1) / 9.0 * 0.23
+        # 1 → 0.40 (wide), 10 → 0.04 (tight) — wide range so the slider is obvious
+        return 0.40 - (level - 1) / 9.0 * 0.36
 
     def _update_minimap_zoom_label(self):
         level = int(self.minimap_zoom.value())
@@ -1029,11 +1029,17 @@ class MainWindow(QMainWindow):
         self._refocus_minimap()
 
     def _refocus_minimap(self):
-        if not hasattr(self, "minimap") or not self.minimap.isVisible():
+        if not hasattr(self, "minimap"):
             return
+        if not self.minimap.isVisible():
+            return
+        mm = self.minimap.map_view
         if self._last_player:
-            self.minimap.map_view.set_player(self._last_player)
-        self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
+            mm.set_player(self._last_player)
+        mm.focus_around_player(self._minimap_focus_fraction())
+        # Ensure the overlay repaints after transform change
+        mm.viewport().update()
+        self.minimap.update()
 
     @Slot(str)
     def on_global_hotkey(self, key: str):

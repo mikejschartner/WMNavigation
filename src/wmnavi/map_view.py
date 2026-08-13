@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PySide6.QtSvgWidgets import QGraphicsSvgItem
 from PySide6.QtWidgets import (
@@ -742,15 +742,28 @@ class MapView(QGraphicsView):
 
     def focus_around_player(self, fraction: float = 0.14):
         """Center + zoom so a fraction of the map around the player fills the view."""
-        if not self.player.isVisible():
-            return
-        pos = self.player.pos()
         if self.crs_bounds:
             min_x, max_x, min_y, max_y = self.crs_bounds
             span = max(max_x - min_x, max_y - min_y, 1.0)
         else:
             rect = self.scene.sceneRect()
+            if rect.isEmpty():
+                return
             span = max(rect.width(), rect.height(), 1.0)
-        radius = span * max(0.04, min(0.5, fraction))
+
+        if self.player.isVisible():
+            pos = self.player.pos()
+        else:
+            # No lock yet — zoom around map center so the slider still does something.
+            if self.crs_bounds:
+                min_x, max_x, min_y, max_y = self.crs_bounds
+                pos = QPointF((min_x + max_x) / 2.0, (min_y + max_y) / 2.0)
+            else:
+                pos = self.scene.sceneRect().center()
+
+        radius = span * max(0.03, min(0.55, float(fraction)))
         area = QRectF(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
+        # resetTransform is required — fitInView alone often no-ops when already zoomed.
+        self.resetTransform()
         self.fitInView(area, Qt.AspectRatioMode.KeepAspectRatio)
+        self.viewport().update()
