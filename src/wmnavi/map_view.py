@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PySide6.QtSvgWidgets import QGraphicsSvgItem
 from PySide6.QtWidgets import (
@@ -739,3 +739,18 @@ class MapView(QGraphicsView):
     def center_on_player(self):
         if self.player.isVisible():
             self.centerOn(self.player)
+
+    def focus_around_player(self, fraction: float = 0.14):
+        """Center + zoom so a fraction of the map around the player fills the view."""
+        if not self.player.isVisible():
+            return
+        pos = self.player.pos()
+        if self.crs_bounds:
+            min_x, max_x, min_y, max_y = self.crs_bounds
+            span = max(max_x - min_x, max_y - min_y, 1.0)
+        else:
+            rect = self.scene.sceneRect()
+            span = max(rect.width(), rect.height(), 1.0)
+        radius = span * max(0.04, min(0.5, fraction))
+        area = QRectF(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
+        self.fitInView(area, Qt.AspectRatioMode.KeepAspectRatio)

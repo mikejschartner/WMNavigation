@@ -39,6 +39,7 @@ from .coords import PlayerState
 from .data_loader import get_interactive_map, list_map_names
 from .floors import FloorOption, build_floor_options, floor_for_y
 from .friend_sync import FriendSync, new_player_id
+from .hotkeys import GlobalHotkeys
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
 from .item_filter_dialog import ItemFilterDialog
 from .layer_sidebar import MapLayersSidebar
@@ -47,9 +48,10 @@ from .loot_filter import items_at_spot, spots_for_selection, spots_passing_price
 from .loot_loader import GAME_MODES
 from .map_data_loader import load_map_layers
 from .map_view import LayerVisibility, MapView
+from .minimap import MiniMapWindow
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
 from .paths import app_root, cache_dir
-from .quest_loader import QuestInfo, load_quests_for_map, load_quests_split, objective_to_task_index
+from .quest_loader import QuestInfo, load_quests_for_map, load_quests_split
 from .quest_log_sync import (
     QuestEvent,
     QuestLogState,
@@ -57,12 +59,6 @@ from .quest_log_sync import (
     import_quest_states_from_logs,
     load_cached_state,
     save_states,
-)
-from .account_link_dialog import AccountLinkDialog
-from .profile_link import (
-    active_ids_from_tracker,
-    fetch_started_quest_ids,
-    fetch_tracker_progress,
 )
 from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
@@ -108,6 +104,7 @@ class Bridge(QObject):
     quests_imported = Signal(object)
     friend_update = Signal(object)
     friend_status = Signal(str)
+    hotkey = Signal(str)
 
 
 class MainWindow(QMainWindow):
@@ -149,13 +146,7 @@ class MainWindow(QMainWindow):
         self.map_quests: list[QuestInfo] = []
         self.anywhere_quests: list[QuestInfo] = []
         self.active_quest_ids: set[str] = set()
-        self.linked_account_id = str(self.settings.value("tarkov_account_id", "") or "")
-        self.linked_account_mode = str(self.settings.value("tarkov_account_mode", "regular") or "regular")
-        self.linked_nickname = str(self.settings.value("tarkov_nickname", "") or "")
-        self.tracker_token = str(self.settings.value("tarkov_tracker_token", "") or "")
         self.player_active_quest_ids: set[str] | None = None  # None = manual catalog mode
-        self._tracker_exclude_ids: set[str] = set()
-        self._tracker_completed_ids: set[str] = set()
         self._quest_log_states: dict[str, QuestLogState] = {}
         cached = load_cached_state(self.current_game_mode)
         if cached:
@@ -183,9 +174,15 @@ class MainWindow(QMainWindow):
         self._friend_prune_timer = QTimer(self)
         self._friend_prune_timer.setInterval(5000)
         self._friend_prune_timer.timeout.connect(self._refresh_friend_markers)
+        self._last_player: PlayerState | None = None
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
+        self.minimap = MiniMapWindow(size_px=int(self.settings.value("minimap_size", 300)))
+        self.hotkeys = GlobalHotkeys(self)
+        self.hotkeys.pressed.connect(self.bridge.hotkey.emit)
+        self.bridge.hotkey.connect(self.on_global_hotkey)
+        self.hotkeys.start()
         self.load_map(self.current_map_slug)
         self.start_watchers()
         self._friend_prune_timer.start()
@@ -344,6 +341,15 @@ class MainWindow(QMainWindow):
         live_row.addWidget(self.live_interval)
         bottom_layout.addLayout(live_row)
 
+        bottom_layout.addWidget(QLabel("Mini map (F7 show · F8 opacity)"))
+        self.minimap_size = QSpinBox()
+        self.minimap_size.setRange(180, 520)
+        self.minimap_size.setSuffix(" px")
+        self.minimap_size.setValue(int(self.settings.value("minimap_size", 300)))
+        self.minimap_size.setToolTip("Size of the F7 overlay on your main monitor")
+        self.minimap_size.valueChanged.connect(self.on_minimap_size_changed)
+        bottom_layout.addWidget(self.minimap_size)
+
         bottom_layout.addWidget(QLabel("Friend raid share"))
         self.friend_name_edit = QLineEdit()
         self.friend_name_edit.setPlaceholderText("Display name")
@@ -433,13 +439,8 @@ class MainWindow(QMainWindow):
         self.btn_refresh_quests = QPushButton("Refresh quests")
         self.btn_refresh_quests.clicked.connect(lambda: self.refresh_player_quests(silent=False))
         top_row.addWidget(self.btn_refresh_quests)
-        self.btn_link_account = QPushButton("Link account…")
-        self.btn_link_account.setToolTip("Optional fallback (tarkov.dev / Tracker). Logs are preferred.")
-        self.btn_link_account.clicked.connect(self.open_account_link)
-        top_row.addWidget(self.btn_link_account)
         top_row.addStretch(1)
         map_layout.addWidget(map_top)
-        self._update_link_btn_label()
 
         self.map_view = MapView()
         self.map_view.player_updated.connect(self._update_pos_label)
@@ -686,43 +687,15 @@ class MainWindow(QMainWindow):
 
     def on_floor_changed(self, index: int):
         if 0 <= index < len(self.floor_options):
-            self.map_view.set_floor(self.floor_options[index])
+            floor = self.floor_options[index]
+            self.map_view.set_floor(floor)
+            if hasattr(self, "minimap"):
+                self.minimap.map_view.set_floor(floor)
+                if self.minimap.isVisible() and self._last_player:
+                    self.minimap.map_view.focus_around_player()
 
     def _quest_settings_key(self) -> str:
         return f"active_quests/{self.current_game_mode}/{self.current_map_slug}"
-
-    def _update_link_btn_label(self):
-        if self.linked_nickname or self.linked_account_id:
-            label = self.linked_nickname or self.linked_account_id
-            if self.tracker_token:
-                self.btn_link_account.setText(f"Linked: {label}")
-            else:
-                self.btn_link_account.setText(f"ID: {label}")
-        else:
-            self.btn_link_account.setText("Link account")
-
-    def open_account_link(self):
-        dialog = AccountLinkDialog(
-            self,
-            account_id=self.linked_account_id,
-            game_mode=self.linked_account_mode or self.current_game_mode,
-            nickname=self.linked_nickname,
-            tracker_token=self.tracker_token,
-        )
-        dialog.linked.connect(self._on_account_linked)
-        dialog.exec()
-
-    def _on_account_linked(self, account_id: str, mode: str, nickname: str, token: str):
-        self.linked_account_id = account_id
-        self.linked_account_mode = mode or "regular"
-        self.linked_nickname = nickname
-        self.tracker_token = token
-        self.settings.setValue("tarkov_account_id", account_id)
-        self.settings.setValue("tarkov_account_mode", self.linked_account_mode)
-        self.settings.setValue("tarkov_nickname", nickname)
-        self.settings.setValue("tarkov_tracker_token", token)
-        self._update_link_btn_label()
-        self.refresh_player_quests()
 
     def import_quests_from_logs(self, *, silent: bool = False):
         """Full Questie-style import from BSG client logs (can take a few seconds)."""
@@ -805,11 +778,7 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_player_quests(self, *, silent: bool = False):
-        """Prefer EFT log state (Questie method); optional Tracker/tarkov.dev fallback."""
-        self._tracker_exclude_ids = set()
-        self._tracker_completed_ids = set()
-
-        # 1) Log-derived active quests
+        """Load active quests from EFT client log state (Questie method)."""
         state = self._quest_log_states.get(self.current_game_mode)
         if state is None:
             state = load_cached_state(self.current_game_mode)
@@ -825,54 +794,15 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        # 2) Optional Tracker / tarkov.dev fallbacks
         self.player_active_quest_ids = None
-        errors: list[str] = []
-
-        if self.tracker_token:
-            try:
-                progress = fetch_tracker_progress(self.tracker_token)
-                index = objective_to_task_index(self.current_game_mode)
-                active = active_ids_from_tracker(progress, index)
-                self._tracker_completed_ids = set(progress.completed_ids) | set(progress.failed_ids)
-                if active:
-                    self.player_active_quest_ids = active
-                elif self._tracker_completed_ids:
-                    self._tracker_exclude_ids = set(self._tracker_completed_ids)
-                if progress.display_name and not self.linked_nickname:
-                    self.linked_nickname = progress.display_name
-                    self.settings.setValue("tarkov_nickname", self.linked_nickname)
-                    self._update_link_btn_label()
-            except Exception as exc:
-                errors.append(str(exc))
-
-        if self.player_active_quest_ids is None and self.linked_account_id and not self.tracker_token:
-            try:
-                started = fetch_started_quest_ids(self.linked_account_id, self.linked_account_mode)
-                if started:
-                    self.player_active_quest_ids = started
-                else:
-                    errors.append(
-                        "No quests in logs yet, and tarkov.dev has no quest list. "
-                        "Click Import from logs after accepting quests in-game."
-                    )
-            except Exception as exc:
-                errors.append(str(exc))
-
         self._reload_quest_lists()
-        if not silent and errors and self.player_active_quest_ids is None and not self._tracker_exclude_ids:
-            QMessageBox.information(self, "Quests", "\n".join(errors))
-        elif not silent and self.player_active_quest_ids is not None:
-            n = len(self.player_active_quest_ids)
+        if not silent:
             self.status_label.setText(
-                f"Loaded {n} active quest(s) · "
-                f"{len(self.map_quests)} on this map · {len(self.anywhere_quests)} anywhere"
+                "No quest log state yet · accept quests in-game, then Import from logs"
             )
-
 
     def _reload_quest_lists(self):
         only_ids = self.player_active_quest_ids
-        exclude = getattr(self, "_tracker_exclude_ids", set()) or set()
 
         if only_ids is not None:
             self.map_quests, self.anywhere_quests = load_quests_split(
@@ -884,10 +814,7 @@ class MainWindow(QMainWindow):
             self.active_quest_ids = {q.id for q in self.map_quests}
             self._save_active_quests()
         else:
-            # Catalog / completed-filtered mode.
             self.map_quests = load_quests_for_map(self.current_map_slug, self.current_game_mode)
-            if exclude:
-                self.map_quests = [q for q in self.map_quests if q.id not in exclude]
             self.anywhere_quests = []
             self._load_active_quests()
             valid = {q.id for q in self.map_quests}
@@ -989,11 +916,15 @@ class MainWindow(QMainWindow):
         if self.floor_combo.currentIndex() == idx:
             # Still ensure map_view floor is set (e.g. after map reload).
             self.map_view.set_floor(match)
+            if hasattr(self, "minimap"):
+                self.minimap.map_view.set_floor(match)
             return
         self.floor_combo.blockSignals(True)
         self.floor_combo.setCurrentIndex(idx)
         self.floor_combo.blockSignals(False)
         self.map_view.set_floor(match)
+        if hasattr(self, "minimap"):
+            self.minimap.map_view.set_floor(match)
 
     def _build_visibility(self) -> LayerVisibility:
         enabled = self.layer_sidebar.enabled_layers()
@@ -1014,7 +945,7 @@ class MainWindow(QMainWindow):
 
     def refresh_map_layers(self):
         self.settings.setValue("item_hunt_enabled", self.chk_item_hunt.isChecked())
-        self.map_view.apply_layer_state(
+        state = dict(
             visibility=self._build_visibility(),
             selected_ids=self._active_hunt_ids(),
             price_filter_ids=self._price_filter_ids(),
@@ -1022,6 +953,68 @@ class MainWindow(QMainWindow):
             quest_spots=self._active_quest_spots(),
             haze_off_floor=True,
         )
+        self.map_view.apply_layer_state(**state)
+        self._sync_minimap_layers(**state)
+
+    def _sync_minimap_layers(self, **state):
+        if not hasattr(self, "minimap"):
+            return
+        self.minimap.map_view.apply_layer_state(**state)
+
+    def _sync_minimap_map(self):
+        if not hasattr(self, "minimap"):
+            return
+        src = self.map_view
+        mm = self.minimap.map_view
+        mm.load_svg(
+            src._svg_source,
+            src.map_rotation,
+            src.map_bounds,
+            src.map_transform,
+            map_meta=src._map_meta,
+            map_slug=src._map_slug,
+        )
+        mm.set_layer_data(self.layer_data)
+        mm.set_floor(src._floor)
+        mm.set_marker_scale(0.7)
+        mm.apply_layer_state(
+            visibility=self._build_visibility(),
+            selected_ids=self._active_hunt_ids(),
+            price_filter_ids=self._price_filter_ids(),
+            hide_loose_stars=bool(self._active_category_ids()),
+            quest_spots=self._active_quest_spots(),
+            haze_off_floor=True,
+        )
+        if self._last_player:
+            mm.set_player(self._last_player)
+            mm.focus_around_player()
+        snaps = self.friend_sync.friends_snapshot() if self.friend_sync.room else {}
+        mm.set_friends(list(snaps.values()), self.current_map_slug)
+
+    def on_minimap_size_changed(self, value: int):
+        self.settings.setValue("minimap_size", int(value))
+        if hasattr(self, "minimap"):
+            self.minimap.set_size_px(int(value))
+
+    @Slot(str)
+    def on_global_hotkey(self, key: str):
+        if key == "f7":
+            visible = self.minimap.toggle()
+            if visible:
+                self._sync_minimap_map()
+                if self._last_player:
+                    self.minimap.map_view.set_player(self._last_player)
+                    self.minimap.map_view.focus_around_player()
+                pct = int(self.minimap.opacity_tier() * 100)
+                self.status_label.setText(f"Mini map on · {pct}% opacity (F8 to cycle)")
+            else:
+                self.status_label.setText("Mini map off (F7)")
+        elif key == "f8":
+            if not self.minimap.isVisible():
+                return
+            self.minimap.cycle_opacity()
+            pct = int(self.minimap.opacity_tier() * 100)
+            self.status_label.setText(f"Mini map opacity {pct}%")
 
     def on_marker_clicked(self, kind: str, point: object, item: ItemInfo | None):
         if kind == "quest" and isinstance(point, MapPoint):
@@ -1151,9 +1144,14 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def on_player_update(self, state: PlayerState):
+        self._last_player = state
         self._select_floor_for_y(state.y)
         self.map_view.set_player(state)
         self.map_view.center_on_player()
+        if hasattr(self, "minimap") and self.minimap.isVisible():
+            self.minimap.map_view.set_player(state)
+            self.minimap.map_view.set_floor(self.map_view._floor)
+            self.minimap.map_view.focus_around_player()
         floor_label = self.floor_combo.currentText()
         self.status_label.setText(
             f"Position locked · X {state.x:.1f}  Y {state.y:.1f}  Z {state.z:.1f}  "
@@ -1213,11 +1211,15 @@ class MainWindow(QMainWindow):
         self.btn_friend_join.setEnabled(True)
         self.friend_status_label.setText("Not in a room")
         self.map_view.set_friends([], self.current_map_slug)
+        if hasattr(self, "minimap"):
+            self.minimap.map_view.set_friends([], self.current_map_slug)
 
     @Slot(object)
     def on_friend_update(self, snaps):
         pings = list((snaps or {}).values())
         self.map_view.set_friends(pings, self.current_map_slug)
+        if hasattr(self, "minimap"):
+            self.minimap.map_view.set_friends(pings, self.current_map_slug)
         if self.friend_sync.room:
             n = self.friend_sync.live_count(self.current_map_slug)
             total = self.friend_sync.live_count()
@@ -1234,7 +1236,10 @@ class MainWindow(QMainWindow):
         if not self.friend_sync.room:
             return
         snaps = self.friend_sync.friends_snapshot()
-        self.map_view.set_friends(list(snaps.values()), self.current_map_slug)
+        pings = list(snaps.values())
+        self.map_view.set_friends(pings, self.current_map_slug)
+        if hasattr(self, "minimap"):
+            self.minimap.map_view.set_friends(pings, self.current_map_slug)
 
     def choose_screenshot_dir(self):
         start = str(self.screenshot_dir if self.screenshot_dir.exists() else Path.home())
@@ -1377,6 +1382,15 @@ class MainWindow(QMainWindow):
         self._live_timer.stop()
         self._friend_prune_timer.stop()
         try:
+            self.hotkeys.stop()
+        except Exception:
+            pass
+        try:
+            self.minimap.hide()
+            self.minimap.close()
+        except Exception:
+            pass
+        try:
             self.friend_sync.leave()
         except Exception:
             pass
@@ -1496,7 +1510,7 @@ class MainWindow(QMainWindow):
         prefix = self._layer_settings_prefix()
         self.layer_sidebar.rebuild(self.layer_data, prefix, self.settings)
 
-        if self.player_active_quest_ids is not None or self._quest_log_states or self.tracker_token or self.linked_account_id:
+        if self.player_active_quest_ids is not None or self._quest_log_states:
             self.refresh_player_quests(silent=True)
         else:
             self.player_active_quest_ids = None
@@ -1527,18 +1541,17 @@ class MainWindow(QMainWindow):
         if layers_empty:
             note += " · no layer data — check net / Refresh map"
         active_q = len(self.active_quest_ids)
-        linked = ""
-        if self.linked_nickname or self.linked_account_id:
-            linked = f" · linked {self.linked_nickname or self.linked_account_id}"
         self.status_label.setText(
             f"{slug.replace('-', ' ').title()} · {total_extracts} extracts · "
             f"{total_containers} containers · {len(self.layer_data.loose_loot)} loose loot · "
             f"{len(self.map_items)} hunt items · {len(self.map_quests)} map quests"
             f"{f' ({active_q} shown)' if active_q else ''}"
             f"{f' · {len(self.anywhere_quests)} anywhere' if self.anywhere_quests else ''}"
-            f"{linked}{note}"
+            f"{note}"
         )
         self._refresh_friend_markers()
+        if hasattr(self, "minimap") and self.minimap.isVisible():
+            self._sync_minimap_map()
 
 
 def run():

@@ -15,6 +15,13 @@ In the sidebar under "Friend raid share":
 4. Friends on the same map see your colored marker + facing arrow.
 Stale pings drop after about 60 seconds. Leave the room when done.
 
+Mini map overlay
+----------------
+F7 — show/hide a top-left mini map on your main monitor (click-through).
+F8 — cycle opacity (30% / 60% / 90%) while it is visible.
+Size is adjustable in the sidebar. Same layers, quests, and friends as the
+main window; the view stays centered on you.
+
 Quests & map data
 -----------------
 Quest lists and map layers (extracts, loot, containers, items) are
