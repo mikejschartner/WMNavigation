@@ -74,3 +74,4 @@ class MapLayerData:
     switches: list[MapPoint] = field(default_factory=list)
     stationary_weapons: list[MapPoint] = field(default_factory=list)
     map_items: dict[str, ItemInfo] = field(default_factory=dict)
+    raid_duration_min: int | None = None

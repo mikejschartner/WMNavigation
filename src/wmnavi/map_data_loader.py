@@ -8,7 +8,7 @@ from collections import defaultdict
 import requests
 
 from .coords import point_in_crs_bounds
-from .loot_loader import _item_from_raw, _load_items_dump, _spot_from_dict, _spot_to_dict
+from .locks import resolve_lock_label
 from .models import ContainerTypeInfo, ItemInfo, LootSpot, MapLayerData, MapPoint
 from .paths import cache_dir
 from .questie_source import find_map_entry, load_questie_labels, resolve_label
@@ -182,12 +182,10 @@ def _load_from_questie(map_slug: str, mode: str) -> MapLayerData | None:
         )
 
     data.map_items = {iid: items_dump[iid] for iid in loose_ids if iid in items_dump}
+    data.raid_duration_min = _raid_duration(entry)
 
     for idx, raw in enumerate(entry.get("locks") or []):
-        pos = raw.get("position") or {}
-        key_id = raw.get("key") or ""
-        key_name = items_dump[key_id].short_name if key_id in items_dump else "Lock"
-        data.locks.append(_point_from_pos(raw.get("id") or f"lock_{idx}", pos, key_name, "lock", dict(raw)))
+        data.locks.append(_lock_point(raw, idx, items_dump))
 
     for idx, raw in enumerate(entry.get("switches") or []):
         pos = raw.get("position") or {}
@@ -274,10 +272,52 @@ def _load_from_api(map_slug: str, mode: str) -> MapLayerData | None:
         )
 
     data.map_items = {iid: items_dump[iid] for iid in loose_ids if iid in items_dump}
+    data.raid_duration_min = _raid_duration(entry)
+
+    for idx, raw in enumerate(entry.get("locks") or []):
+        data.locks.append(_lock_point(raw, idx, items_dump))
+
+    for idx, raw in enumerate(entry.get("switches") or []):
+        pos = raw.get("position") or {}
+        name = raw.get("name") or f"Switch {idx + 1}"
+        data.switches.append(_point_from_pos(raw.get("id") or f"switch_{idx}", pos, name, "switch", dict(raw)))
+
+    for idx, raw in enumerate(entry.get("stationaryWeapons") or []):
+        pos = raw.get("position") or {}
+        weapon = raw.get("stationaryWeapon")
+        if isinstance(weapon, dict):
+            label = weapon.get("shortName") or weapon.get("name") or "Gun"
+        else:
+            label = "Stationary gun"
+        data.stationary_weapons.append(
+            _point_from_pos(raw.get("id") or f"gun_{idx}", pos, label, "stationary", dict(raw))
+        )
     return data
 
 
-LAYER_CACHE_VERSION = 4
+def _raid_duration(entry: dict | None) -> int | None:
+    if not entry:
+        return None
+    raw = entry.get("raidDuration")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _lock_point(raw: dict, idx: int, items_dump: dict) -> MapPoint:
+    pos = raw.get("position") or {}
+    key_name = resolve_lock_label(raw, items_dump)
+    meta = dict(raw)
+    meta["key_name"] = key_name
+    key = raw.get("key")
+    if isinstance(key, dict) and key.get("id"):
+        meta["key"] = key.get("id")
+    return _point_from_pos(raw.get("id") or f"lock_{idx}", pos, key_name, "lock", meta)
+
+
+LAYER_CACHE_VERSION = 5
 
 
 def _point_ok(point: MapPoint | LootSpot, map_meta: dict | None) -> bool:
@@ -351,6 +391,7 @@ def _serialize(data: MapLayerData) -> dict:
         "switches": [point_dict(p) for p in data.switches],
         "stationary_weapons": [point_dict(p) for p in data.stationary_weapons],
         "map_item_ids": sorted(data.map_items.keys()),
+        "raid_duration_min": data.raid_duration_min,
     }
 
 
@@ -383,6 +424,11 @@ def _deserialize(raw: dict, items_dump: dict[str, ItemInfo]) -> MapLayerData:
     data.stationary_weapons = [point_from(p) for p in raw.get("stationary_weapons") or []]
     item_ids = raw.get("map_item_ids") or []
     data.map_items = {iid: items_dump[iid] for iid in item_ids if iid in items_dump}
+    duration = raw.get("raid_duration_min")
+    try:
+        data.raid_duration_min = int(duration) if duration else None
+    except (TypeError, ValueError):
+        data.raid_duration_min = None
     return data
 
 
@@ -398,7 +444,22 @@ def load_map_layers(map_slug: str, mode: str, map_meta: dict | None = None) -> M
         except json.JSONDecodeError:
             pass
 
-    data = _load_from_api(map_slug, mode) or _load_from_questie(map_slug, mode) or MapLayerData()
+    api_data = _load_from_api(map_slug, mode)
+    questie_data = _load_from_questie(map_slug, mode)
+    data = api_data or questie_data or MapLayerData()
+    if api_data and questie_data:
+        if not api_data.locks:
+            api_data.locks = questie_data.locks
+        if not api_data.switches:
+            api_data.switches = questie_data.switches
+        if not api_data.stationary_weapons:
+            api_data.stationary_weapons = questie_data.stationary_weapons
+        if not api_data.raid_duration_min:
+            api_data.raid_duration_min = questie_data.raid_duration_min
+        data = api_data
+    if not data.raid_duration_min:
+        entry = find_map_entry(mode, map_slug)
+        data.raid_duration_min = _raid_duration(entry)
     if not data.map_items and data.loose_loot:
         loose_ids: set[str] = set()
         for spot in data.loose_loot:

@@ -27,6 +27,7 @@ EXTRACT_COLORS = {
     "scav": "#f59e0b",
     "coop": "#38bdf8",
     "transit": "#c084fc",
+    "lock": "#fbbf24",
 }
 
 

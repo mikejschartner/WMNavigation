@@ -35,7 +35,20 @@ from watchdog.observers import Observer
 
 from . import __version__
 from .assets import cache_remote_file
+from .compass import CompassHud
 from .coords import PlayerState
+from .extract_panel import ExtractAvailabilityPanel, unique_extracts
+from .heading import HeadingTracker
+from .locks import locked_loot_ids as compute_locked_loot_ids
+from .nav_graph import NavGraph
+from .raid_time import remaining_seconds
+from .route_planner import (
+    RouteResult,
+    plan_loot_route,
+    plan_quest_route,
+    player_moved_enough,
+    should_refresh_route,
+)
 from .data_loader import get_interactive_map, list_map_names
 from .floors import FloorOption, build_floor_options, floor_for_y
 from .friend_sync import FriendSync, new_player_id
@@ -104,6 +117,7 @@ class Bridge(QObject):
     quests_imported = Signal(object)
     friend_update = Signal(object)
     friend_status = Signal(str)
+    route_ready = Signal(object)
 
 
 class MainWindow(QMainWindow):
@@ -123,6 +137,7 @@ class MainWindow(QMainWindow):
         self.bridge.quests_imported.connect(self.on_quests_imported)
         self.bridge.friend_update.connect(self.on_friend_update)
         self.bridge.friend_status.connect(self.on_friend_status)
+        self.bridge.route_ready.connect(self.on_route_ready)
 
         player_id = str(self.settings.value("friend_player_id", "") or "")
         if not player_id:
@@ -174,6 +189,18 @@ class MainWindow(QMainWindow):
         self._friend_prune_timer.setInterval(5000)
         self._friend_prune_timer.timeout.connect(self._refresh_friend_markers)
         self._last_player: PlayerState | None = None
+        self._screenshot_loop_on = True
+        self.heading = HeadingTracker()
+        self.compass = None
+        self.nav_graph = NavGraph()
+        self._locked_loot_ids: set[str] = set()
+        self._active_route: RouteResult | None = None
+        self._route_kind: str | None = None
+        self._route_origin: tuple[float, float, float] | None = None
+        self._route_gen = 0
+        self._route_refresh_timer = QTimer(self)
+        self._route_refresh_timer.setSingleShot(True)
+        self._route_refresh_timer.timeout.connect(self._maybe_refresh_route)
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
@@ -204,6 +231,7 @@ class MainWindow(QMainWindow):
         try:
             size = int(self.settings.value("minimap_size", 300) or 300)
             self.minimap = MiniMapWindow(size_px=size)
+            self.minimap.map_view.set_marker_scale(self._minimap_marker_scale())
             return True
         except Exception as exc:
             self.status_label.setText(f"Mini map failed: {exc}")
@@ -324,6 +352,24 @@ class MainWindow(QMainWindow):
         self.chk_item_hunt.stateChanged.connect(self.refresh_map_layers)
         bottom_layout.addWidget(self.chk_item_hunt)
 
+        self.chk_hide_locked_loot = QCheckBox("Hide Locked Room Loot")
+        self.chk_hide_locked_loot.setToolTip(
+            "Hide loot behind keyed doors. Does not change the Loot Route planner, which always skips locked rooms."
+        )
+        self.chk_hide_locked_loot.setChecked(self.settings.value("hide_locked_room_loot", False, type=bool))
+        self.chk_hide_locked_loot.stateChanged.connect(self.on_hide_locked_loot_changed)
+        bottom_layout.addWidget(self.chk_hide_locked_loot)
+
+        self.chk_show_locked_doors = QCheckBox("Show Locked Doors")
+        self.chk_show_locked_doors.setToolTip("Mark exact keyed door positions and the key name required.")
+        self.chk_show_locked_doors.setChecked(self.settings.value("show_locked_doors", False, type=bool))
+        self.chk_show_locked_doors.stateChanged.connect(self.on_show_locked_doors_changed)
+        bottom_layout.addWidget(self.chk_show_locked_doors)
+
+        self.extract_panel = ExtractAvailabilityPanel()
+        self.extract_panel.changed.connect(self.on_extracts_available_changed)
+        bottom_layout.addWidget(self.extract_panel)
+
         bottom_layout.addWidget(QLabel("Marker size"))
         self.marker_scale_slider = QSlider(Qt.Orientation.Horizontal)
         self.marker_scale_slider.setRange(40, 250)
@@ -350,7 +396,7 @@ class MainWindow(QMainWindow):
         live_row = QHBoxLayout()
         self.chk_live = QCheckBox("Continuous mode")
         self.chk_live.setToolTip(
-            "While in raid, press V every N seconds for a live map track. Stops when you extract."
+            "While in raid, press V every N seconds for a live map track. Stops when you extract. F6 toggles this loop."
         )
         self.chk_live.setChecked(self.settings.value("live_mode", False, type=bool))
         self.chk_live.stateChanged.connect(self.on_live_mode_changed)
@@ -364,7 +410,7 @@ class MainWindow(QMainWindow):
         live_row.addWidget(self.live_interval)
         bottom_layout.addLayout(live_row)
 
-        bottom_layout.addWidget(QLabel("Mini map (F7 show · F8 opacity)"))
+        bottom_layout.addWidget(QLabel("Mini map (F7) · opacity (F8) · compass (F9)"))
         self.minimap_size = QSpinBox()
         self.minimap_size.setRange(180, 520)
         self.minimap_size.setSuffix(" px")
@@ -374,14 +420,31 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(self.minimap_size)
         bottom_layout.addWidget(QLabel("Mini map zoom"))
         self.minimap_zoom = QSlider(Qt.Orientation.Horizontal)
-        self.minimap_zoom.setRange(1, 10)
-        self.minimap_zoom.setValue(int(self.settings.value("minimap_zoom", 5)))
-        self.minimap_zoom.setToolTip("1 = wide area · 10 = zoomed in close on you")
+        self.minimap_zoom.setRange(1, 20)
+        saved_zoom = int(self.settings.value("minimap_zoom", 5))
+        self.minimap_zoom.setValue(max(1, min(20, saved_zoom)))
+        self.minimap_zoom.setToolTip("1 = wide area around you · 20 = very close overlay zoom")
         self.minimap_zoom.valueChanged.connect(self.on_minimap_zoom_changed)
         bottom_layout.addWidget(self.minimap_zoom)
         self.minimap_zoom_label = QLabel()
         bottom_layout.addWidget(self.minimap_zoom_label)
         self._update_minimap_zoom_label()
+
+        bottom_layout.addWidget(QLabel("Mini map marker size"))
+        self.minimap_marker_slider = QSlider(Qt.Orientation.Horizontal)
+        self.minimap_marker_slider.setRange(40, 250)
+        self.minimap_marker_slider.setValue(
+            int(float(self.settings.value("minimap_marker_scale", 0.7)) * 100)
+        )
+        self.minimap_marker_slider.setToolTip("Size of loot/extract/quest markers on the F7 overlay only")
+        self.minimap_marker_slider.valueChanged.connect(self.on_minimap_marker_scale_changed)
+        bottom_layout.addWidget(self.minimap_marker_slider)
+        self.minimap_marker_label = QLabel()
+        bottom_layout.addWidget(self.minimap_marker_label)
+        self._update_minimap_marker_label()
+        self._minimap_marker_timer = QTimer(self)
+        self._minimap_marker_timer.setSingleShot(True)
+        self._minimap_marker_timer.timeout.connect(self._apply_minimap_marker_scale)
 
         bottom_layout.addWidget(QLabel("Friend raid share"))
         self.friend_name_edit = QLineEdit()
@@ -472,6 +535,14 @@ class MainWindow(QMainWindow):
         self.btn_refresh_quests = QPushButton("Refresh quests")
         self.btn_refresh_quests.clicked.connect(lambda: self.refresh_player_quests(silent=False))
         top_row.addWidget(self.btn_refresh_quests)
+        self.btn_quest_route = QPushButton("Quest Route")
+        self.btn_quest_route.setToolTip("Fastest route through currently selected quest objectives, ending at a checked extract.")
+        self.btn_quest_route.clicked.connect(lambda: self.start_route("quest"))
+        top_row.addWidget(self.btn_quest_route)
+        self.btn_loot_route = QPushButton("Loot Route")
+        self.btn_loot_route.setToolTip("Efficient accessible loot route ending at a checked extract. Skips locked rooms.")
+        self.btn_loot_route.clicked.connect(lambda: self.start_route("loot"))
+        top_row.addWidget(self.btn_loot_route)
         top_row.addStretch(1)
         map_layout.addWidget(map_top)
 
@@ -509,6 +580,25 @@ class MainWindow(QMainWindow):
         scale = self.marker_scale_slider.value() / 100.0
         self.settings.setValue("marker_scale", scale)
         self.map_view.set_marker_scale(scale)
+
+    def _minimap_marker_scale(self) -> float:
+        if hasattr(self, "minimap_marker_slider"):
+            return self.minimap_marker_slider.value() / 100.0
+        return float(self.settings.value("minimap_marker_scale", 0.7))
+
+    def _update_minimap_marker_label(self):
+        scale = self._minimap_marker_scale()
+        self.minimap_marker_label.setText(f"Mini map markers: {scale:.0%}")
+
+    def on_minimap_marker_scale_changed(self, _value: int):
+        self._update_minimap_marker_label()
+        self._minimap_marker_timer.start(120)
+
+    def _apply_minimap_marker_scale(self):
+        scale = self._minimap_marker_scale()
+        self.settings.setValue("minimap_marker_scale", scale)
+        if self._minimap_ok():
+            self.minimap.map_view.set_marker_scale(scale)
 
     def check_for_updates(self):
         if not self.settings.value("auto_update_check", True, type=bool):
@@ -728,7 +818,7 @@ class MainWindow(QMainWindow):
             if self._minimap_ok():
                 self.minimap.map_view.set_floor(floor)
                 if self.minimap.isVisible() and self._last_player:
-                    self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
+                    self._refocus_minimap_view(self.minimap.map_view)
 
     def _quest_settings_key(self) -> str:
         return f"active_quests/{self.current_game_mode}/{self.current_map_slug}"
@@ -858,6 +948,7 @@ class MainWindow(QMainWindow):
 
         self._rebuild_quest_menu()
         self.refresh_map_layers()
+        self._refresh_quest_route_if_active()
 
     def _load_active_quests(self):
         raw = self.settings.value(self._quest_settings_key(), "")
@@ -915,6 +1006,7 @@ class MainWindow(QMainWindow):
             self._quest_panel.set_all_map_checked(False)
         self._update_quest_btn_label()
         self.refresh_map_layers()
+        self._refresh_quest_route_if_active()
 
     def _show_all_map_quests(self):
         self.active_quest_ids = {q.id for q in self.map_quests}
@@ -923,6 +1015,7 @@ class MainWindow(QMainWindow):
             self._quest_panel.set_all_map_checked(True)
         self._update_quest_btn_label()
         self.refresh_map_layers()
+        self._refresh_quest_route_if_active()
 
     def _on_quest_toggled(self, quest_id: str, checked: bool):
         if checked:
@@ -932,6 +1025,11 @@ class MainWindow(QMainWindow):
         self._save_active_quests()
         self._update_quest_btn_label()
         self.refresh_map_layers()
+        self._refresh_quest_route_if_active()
+
+    def _refresh_quest_route_if_active(self):
+        if self._route_kind == "quest":
+            self._plan_route_async("quest", force=True)
 
     def _active_quest_spots(self) -> list[MapPoint]:
         spots: list[MapPoint] = []
@@ -977,6 +1075,7 @@ class MainWindow(QMainWindow):
             stationary_weapons=enabled.get("stationary_weapons", False),
             # Categories force item icons even if "Show selected" is off.
             item_hunt=self.chk_item_hunt.isChecked() or category_on,
+            show_locked_doors=self.chk_show_locked_doors.isChecked(),
         )
 
     def refresh_map_layers(self):
@@ -988,6 +1087,9 @@ class MainWindow(QMainWindow):
             hide_loose_stars=bool(self._active_category_ids()),
             quest_spots=self._active_quest_spots(),
             haze_off_floor=True,
+            hide_locked_room_loot=self.chk_hide_locked_loot.isChecked(),
+            locked_loot_ids=self._locked_loot_ids,
+            show_locked_doors=self.chk_show_locked_doors.isChecked(),
         )
         self.map_view.apply_layer_state(**state)
         self._sync_minimap_layers(**state)
@@ -1012,7 +1114,7 @@ class MainWindow(QMainWindow):
         )
         mm.set_layer_data(self.layer_data)
         mm.set_floor(src._floor)
-        mm.set_marker_scale(0.7)
+        mm.set_marker_scale(self._minimap_marker_scale())
         mm.apply_layer_state(
             visibility=self._build_visibility(),
             selected_ids=self._active_hunt_ids(),
@@ -1020,34 +1122,56 @@ class MainWindow(QMainWindow):
             hide_loose_stars=bool(self._active_category_ids()),
             quest_spots=self._active_quest_spots(),
             haze_off_floor=True,
+            hide_locked_room_loot=self.chk_hide_locked_loot.isChecked(),
+            locked_loot_ids=self._locked_loot_ids,
+            show_locked_doors=self.chk_show_locked_doors.isChecked(),
         )
         if self._last_player:
             mm.set_player(self._last_player)
-            mm.focus_around_player(self._minimap_focus_fraction())
+            self._refocus_minimap_view(mm)
         snaps = self.friend_sync.friends_snapshot() if self.friend_sync.room else {}
         mm.set_friends(list(snaps.values()), self.current_map_slug)
+        if self._active_route and self._active_route.ok and self._active_route.waypoints:
+            color = "#a855f7" if self._active_route.kind == "quest" else "#f59e0b"
+            mm.set_route(self._active_route.waypoints, color=color, stops=self._active_route.stops)
 
     def on_minimap_size_changed(self, value: int):
         self.settings.setValue("minimap_size", int(value))
         if self._minimap_ok():
             self.minimap.set_size_px(int(value))
 
+    def _minimap_radius_m(self) -> float:
+        """Slider 1–20 → world meters shown around you on the F7 overlay."""
+        level = int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 8
+        level = max(1, min(20, level))
+        # Exponential so high levels get much closer than a % of the whole map.
+        # 1 ≈ 160m, 10 ≈ 30m, 20 ≈ 8m
+        return max(8.0, 160.0 * (0.83 ** (level - 1)))
+
     def _minimap_focus_fraction(self) -> float:
-        """Slider 1–10 → map span fraction (lower = more zoomed in)."""
-        level = int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 5
-        level = max(1, min(10, level))
-        # 1 → 0.40 (wide), 10 → 0.04 (tight) — wide range so the slider is obvious
-        return 0.40 - (level - 1) / 9.0 * 0.36
+        """Legacy fraction fallback if a map has no transform scale."""
+        level = int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 8
+        level = max(1, min(20, level))
+        return max(0.004, 0.22 * (0.83 ** (level - 1)))
+
+    def _refocus_minimap_view(self, view) -> None:
+        view.focus_around_player(
+            self._minimap_focus_fraction(),
+            radius_m=self._minimap_radius_m(),
+        )
 
     def _update_minimap_zoom_label(self):
         level = int(self.minimap_zoom.value())
+        meters = self._minimap_radius_m()
         if level <= 3:
             tip = "wide"
         elif level <= 7:
             tip = "medium"
-        else:
+        elif level <= 12:
             tip = "close"
-        self.minimap_zoom_label.setText(f"Zoom {level}/10 · {tip}")
+        else:
+            tip = "tight"
+        self.minimap_zoom_label.setText(f"Zoom {level}/20 · {tip} · ~{meters:.0f}m")
 
     def on_minimap_zoom_changed(self, value: int):
         self.settings.setValue("minimap_zoom", int(value))
@@ -1060,13 +1184,15 @@ class MainWindow(QMainWindow):
         mm = self.minimap.map_view
         if self._last_player:
             mm.set_player(self._last_player)
-        mm.focus_around_player(self._minimap_focus_fraction())
+        self._refocus_minimap_view(mm)
         mm.viewport().update()
         self.minimap.update()
 
     @Slot(str)
     def on_global_hotkey(self, key: str):
-        if key == "f7":
+        if key == "f6":
+            self._set_screenshot_loop(not self._screenshot_loop_on)
+        elif key == "f7":
             if not self._ensure_minimap():
                 return
             visible = self.minimap.toggle()
@@ -1083,6 +1209,8 @@ class MainWindow(QMainWindow):
             self.minimap.cycle_opacity()
             pct = int(self.minimap.opacity_tier() * 100)
             self.status_label.setText(f"Mini map opacity {pct}%")
+        elif key == "f9":
+            self._toggle_compass()
 
     def on_marker_clicked(self, kind: str, point: object, item: ItemInfo | None):
         if kind == "quest" and isinstance(point, MapPoint):
@@ -1213,13 +1341,21 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def on_player_update(self, state: PlayerState):
         self._last_player = state
+        self.heading.set_authoritative(state.yaw_deg, self.map_view.map_rotation)
         self._select_floor_for_y(state.y)
         self.map_view.set_player(state)
         self.map_view.center_on_player()
+        if self.compass is not None:
+            self.compass.set_player_xz(state.x, state.z)
+            self.compass.set_world_context(
+                self.map_view.map_rotation,
+                self.map_view.map_transform,
+                self.current_map_slug,
+            )
         if self._minimap_ok() and self.minimap.isVisible():
             self.minimap.map_view.set_player(state)
             self.minimap.map_view.set_floor(self.map_view._floor)
-            self.minimap.map_view.focus_around_player(self._minimap_focus_fraction())
+            self._refocus_minimap_view(self.minimap.map_view)
         floor_label = self.floor_combo.currentText()
         self.status_label.setText(
             f"Position locked · X {state.x:.1f}  Y {state.y:.1f}  Z {state.z:.1f}  "
@@ -1235,6 +1371,8 @@ class MainWindow(QMainWindow):
                 name=self.friend_name_edit.text(),
                 color=self._friend_color,
             )
+        if self._route_kind:
+            self._route_refresh_timer.start(1800)
 
     def _apply_friend_color_btn(self):
         color = self._friend_color if str(self._friend_color).startswith("#") else f"#{self._friend_color}"
@@ -1281,6 +1419,8 @@ class MainWindow(QMainWindow):
         self.map_view.set_friends([], self.current_map_slug)
         if self._minimap_ok():
             self.minimap.map_view.set_friends([], self.current_map_slug)
+        if self.compass is not None:
+            self.compass.set_friends([], self.current_map_slug)
 
     @Slot(object)
     def on_friend_update(self, snaps):
@@ -1288,6 +1428,8 @@ class MainWindow(QMainWindow):
         self.map_view.set_friends(pings, self.current_map_slug)
         if self._minimap_ok():
             self.minimap.map_view.set_friends(pings, self.current_map_slug)
+        if self.compass is not None:
+            self.compass.set_friends(pings, self.current_map_slug)
         if self.friend_sync.room:
             n = self.friend_sync.live_count(self.current_map_slug)
             total = self.friend_sync.live_count()
@@ -1308,6 +1450,8 @@ class MainWindow(QMainWindow):
         self.map_view.set_friends(pings, self.current_map_slug)
         if self._minimap_ok():
             self.minimap.map_view.set_friends(pings, self.current_map_slug)
+        if self.compass is not None:
+            self.compass.set_friends(pings, self.current_map_slug)
 
     def choose_screenshot_dir(self):
         start = str(self.screenshot_dir if self.screenshot_dir.exists() else Path.home())
@@ -1320,6 +1464,8 @@ class MainWindow(QMainWindow):
         self._restart_screenshot_watch()
 
     def handle_screenshot(self, path: Path):
+        if not self._screenshot_loop_on:
+            return
         key = str(path.resolve()) if path.exists() else str(path)
         if key in self._seen_screenshots:
             return
@@ -1351,6 +1497,8 @@ class MainWindow(QMainWindow):
 
     def _poll_screenshots(self):
         """Backup for OneDrive folders where filesystem events are flaky."""
+        if not self._screenshot_loop_on:
+            return
         folder = self.screenshot_dir
         if not folder.is_dir():
             return
@@ -1425,7 +1573,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.observer = None
             self.status_label.setText(f"Screenshot watch failed: {exc}")
-        self._screenshot_poll.start()
+        if self._screenshot_loop_on and not self._screenshot_poll.isActive():
+            self._screenshot_poll.start()
         self.screenshot_path_label.setText(str(folder))
         self.status_label.setText(f"Watching Tarkov screenshots (V) → {folder}")
 
@@ -1449,6 +1598,12 @@ class MainWindow(QMainWindow):
         self._screenshot_poll.stop()
         self._live_timer.stop()
         self._friend_prune_timer.stop()
+        self._route_refresh_timer.stop()
+        try:
+            if self.compass is not None:
+                self.compass.shutdown()
+        except Exception:
+            pass
         try:
             self.hotkeys.stop()
         except Exception:
@@ -1513,7 +1668,7 @@ class MainWindow(QMainWindow):
             return
         interval_ms = max(2, int(self.live_interval.value())) * 1000
         self._live_timer.setInterval(interval_ms)
-        if self.chk_live.isChecked() and self.in_raid:
+        if self.chk_live.isChecked() and self.in_raid and self._screenshot_loop_on:
             if not self._live_timer.isActive():
                 self._live_timer.start()
                 self._on_live_tick()
@@ -1521,7 +1676,7 @@ class MainWindow(QMainWindow):
             self._live_timer.stop()
 
     def _on_live_tick(self):
-        if not self.chk_live.isChecked() or not self.in_raid:
+        if not self.chk_live.isChecked() or not self.in_raid or not self._screenshot_loop_on:
             self._live_timer.stop()
             return
         if press_v_in_raid():
@@ -1530,6 +1685,229 @@ class MainWindow(QMainWindow):
 
     def center_player(self):
         self.map_view.center_on_player()
+
+    def on_hide_locked_loot_changed(self):
+        self.settings.setValue("hide_locked_room_loot", self.chk_hide_locked_loot.isChecked())
+        self.refresh_map_layers()
+
+    def on_show_locked_doors_changed(self):
+        self.settings.setValue("show_locked_doors", self.chk_show_locked_doors.isChecked())
+        self.refresh_map_layers()
+
+    def _extract_settings_key(self) -> str:
+        return f"extracts_available/{self.current_game_mode}/{self.current_map_slug}"
+
+    def _rebuild_extract_panel(self):
+        extracts = unique_extracts(
+            self.layer_data.extracts_pmc,
+            self.layer_data.extracts_scav,
+            self.layer_data.extracts_coop,
+        )
+        raw = self.settings.value(self._extract_settings_key(), None)
+        selected = None
+        if isinstance(raw, str) and raw.strip():
+            selected = {x for x in raw.split("|") if x}
+        elif isinstance(raw, (list, tuple)):
+            selected = {str(x) for x in raw}
+        self.extract_panel.rebuild(extracts, selected)
+
+    def on_extracts_available_changed(self):
+        keys = self.extract_panel.selected_keys()
+        self.settings.setValue(self._extract_settings_key(), "|".join(sorted(keys)))
+        if self._route_kind:
+            self._plan_route_async(self._route_kind, force=True)
+
+    def _set_screenshot_loop(self, on: bool):
+        """F6: enable/disable the existing screenshot loop without creating a second one."""
+        on = bool(on)
+        if on == self._screenshot_loop_on:
+            return
+        self._screenshot_loop_on = on
+        if on:
+            if not self._screenshot_poll.isActive():
+                self._screenshot_poll.start()
+            self._sync_live_timer()
+            self.status_label.setText("Screenshot processing on (F6)")
+        else:
+            self._live_timer.stop()
+            self._screenshot_poll.stop()
+            self.status_label.setText("Screenshot processing off (F6)")
+
+    def _ensure_compass(self) -> bool:
+        if self.compass is not None:
+            return True
+        try:
+            self.compass = CompassHud(self.heading)
+            if self._last_player:
+                self.heading.set_authoritative(
+                    self._last_player.yaw_deg, self.map_view.map_rotation
+                )
+                self.compass.set_player_xz(self._last_player.x, self._last_player.z)
+            self.compass.set_world_context(
+                self.map_view.map_rotation,
+                self.map_view.map_transform,
+                self.current_map_slug,
+            )
+            snaps = self.friend_sync.friends_snapshot() if self.friend_sync.room else {}
+            self.compass.set_friends(list(snaps.values()), self.current_map_slug)
+            return True
+        except Exception as exc:
+            self.status_label.setText(f"Compass failed: {exc}")
+            self.compass = None
+            return False
+
+    def _toggle_compass(self):
+        if not self._ensure_compass():
+            return
+        if self._last_player:
+            self.heading.set_authoritative(
+                self._last_player.yaw_deg, self.map_view.map_rotation
+            )
+            self.compass.set_player_xz(self._last_player.x, self._last_player.z)
+        visible = self.compass.toggle()
+        if visible:
+            self.status_label.setText("Compass on (F9)")
+        else:
+            self.status_label.setText("Compass off (F9)")
+
+    def _available_extracts(self) -> list:
+        return self.extract_panel.selected_points()
+
+    def start_route(self, kind: str):
+        if not self._last_player:
+            QMessageBox.information(self, "Route", "No player position yet. Press V in-raid first.")
+            return
+        extracts = self._available_extracts()
+        if not extracts:
+            QMessageBox.information(self, "Route", "Select at least one available extract.")
+            self.status_label.setText("Select at least one available extract.")
+            return
+        if kind == "quest" and not self.active_quest_ids:
+            QMessageBox.information(self, "Quest Route", "No quests selected.")
+            self.status_label.setText("No quests selected.")
+            return
+        self._route_kind = kind
+        self._route_origin = (self._last_player.x, self._last_player.y, self._last_player.z)
+        self.status_label.setText("Planning route…")
+        self._plan_route_async(kind, force=True)
+
+    def _plan_route_async(self, kind: str, *, force: bool = False):
+        player = self._last_player
+        if not player:
+            return
+        extracts = list(self._available_extracts())
+        spots = list(self._active_quest_spots())
+        loot_spots = list(self.layer_data.loose_loot)
+        items = dict(self.map_items)
+        allowed = self._price_filter_ids()
+        hunt = self._active_hunt_ids()
+        if hunt:
+            allowed = hunt if allowed is None else (allowed & hunt)
+        locked = set(self._locked_loot_ids)
+        remaining = remaining_seconds(
+            in_raid=self.in_raid,
+            raid_started_at=self.raid_started_at,
+            duration_min=self.layer_data.raid_duration_min,
+        )
+        graph = self.nav_graph
+        origin = (player.x, player.y, player.z)
+        min_price = self.price_slider.value() if self.chk_price.isChecked() else 50_000
+        self._route_gen += 1
+        gen = self._route_gen
+        prev = self._active_route if not force else None
+        alert = force
+        self._route_alert = alert
+
+        def work():
+            try:
+                if kind == "quest":
+                    result = plan_quest_route(
+                        player=origin,
+                        quest_spots=spots,
+                        extracts=extracts,
+                        graph=graph,
+                    )
+                else:
+                    result = plan_loot_route(
+                        player=origin,
+                        spots=loot_spots,
+                        items=items,
+                        extracts=extracts,
+                        allowed_ids=allowed,
+                        locked_ids=locked,
+                        remaining_s=remaining,
+                        graph=graph,
+                        min_value=min_price,
+                    )
+                result.gen = gen
+                if not force and not should_refresh_route(prev, origin, result):
+                    result = RouteResult(kind=kind, ok=True, message="__keep__", gen=gen)
+                    result.stops = []
+                self.bridge.route_ready.emit(result)
+            except Exception as exc:
+                self.bridge.route_ready.emit(
+                    RouteResult(kind=kind, ok=False, message=str(exc), gen=gen)
+                )
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @Slot(object)
+    def on_route_ready(self, result):
+        if not isinstance(result, RouteResult):
+            return
+        if result.gen != self._route_gen:
+            return
+        if result.message == "__keep__":
+            return
+        if not result.ok:
+            self.status_label.setText(result.message or "Route failed.")
+            if getattr(self, "_route_alert", False) and result.message:
+                QMessageBox.information(self, "Route", result.message)
+            return
+        self._active_route = result
+        self._route_kind = result.kind
+        color = "#a855f7" if result.kind == "quest" else "#f59e0b"
+        self.map_view.set_route(result.waypoints, color=color, stops=result.stops)
+        if self._minimap_ok():
+            self.minimap.map_view.set_route(result.waypoints, color=color, stops=result.stops)
+        note = result.message
+        if result.skipped:
+            note += " · skipped " + "; ".join(result.skipped[:3])
+        self.status_label.setText(note)
+
+    def _maybe_refresh_route(self):
+        if not self._route_kind or not self._last_player:
+            return
+        now = (self._last_player.x, self._last_player.y, self._last_player.z)
+        if not player_moved_enough(self._route_origin, now) and self._route_kind != "loot":
+            return
+        self._route_origin = now
+        self._plan_route_async(self._route_kind, force=False)
+
+    def _load_nav_graph(self, slug: str):
+        """Optional future nav nodes: data/nav/{slug}.json. Empty = straight-line A* fallback."""
+        self.nav_graph = NavGraph()
+        path = app_root() / "data" / "nav" / f"{slug}.json"
+        if not path.exists():
+            return
+        try:
+            import json
+
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            from .nav_graph import NavNode
+
+            nodes = [
+                NavNode(float(n["x"]), float(n.get("y") or 0), float(n["z"]), str(n.get("id") or i))
+                for i, n in enumerate(raw.get("nodes") or [])
+            ]
+            edges = []
+            for e in raw.get("edges") or []:
+                if len(e) >= 2:
+                    cost = float(e[2]) if len(e) > 2 else 1.0
+                    edges.append((int(e[0]), int(e[1]), cost))
+            self.nav_graph.load(nodes, edges or None)
+        except Exception:
+            self.nav_graph = NavGraph()
 
     def load_map(self, slug: str, force_fetch: bool = False):
         self.current_map_slug = slug
@@ -1557,6 +1935,15 @@ class MainWindow(QMainWindow):
 
         self.layer_data = load_map_layers(slug, self.current_game_mode, map_meta=meta)
         self.map_items = self.layer_data.map_items
+        self._locked_loot_ids = compute_locked_loot_ids(
+            self.layer_data.loose_loot, self.layer_data.locks
+        )
+        self._load_nav_graph(slug)
+        self.map_view.clear_route()
+        if self._minimap_ok():
+            self.minimap.map_view.clear_route()
+        self._active_route = None
+        self._route_kind = None
         self.floor_options = build_floor_options(meta)
         self.floor_combo.blockSignals(True)
         self.floor_combo.clear()
@@ -1591,6 +1978,13 @@ class MainWindow(QMainWindow):
             self._rebuild_quest_menu()
 
         self._load_selection()
+        self._rebuild_extract_panel()
+        if self.compass is not None:
+            self.compass.set_world_context(
+                self.map_view.map_rotation,
+                self.map_view.map_transform,
+                slug,
+            )
         self.apply_item_filters()
 
         total_extracts = (

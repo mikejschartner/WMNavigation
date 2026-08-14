@@ -1,4 +1,10 @@
-"""Filter items and loot spots by price + selection."""
+"""Filter items and loot spots by price, selection, and locked-room visibility.
+
+Pipeline used by the map:
+  1. Minimum value (optional)
+  2. Selected items / quick categories
+  3. Hide locked-room loot (display only; loot routing always skips keyed rooms)
+"""
 
 from __future__ import annotations
 
@@ -57,6 +63,20 @@ def spots_passing_price(
     if not allowed_ids:
         return []
     return [spot for spot in spots if any(iid in allowed_ids for iid in spot.item_ids)]
+
+
+def filter_spots(
+    spots: list[LootSpot],
+    *,
+    allowed_ids: set[str] | None = None,
+    hide_locked: bool = False,
+    locked_ids: set[str] | None = None,
+) -> list[LootSpot]:
+    """Display pipeline: min-price/selection ids, then optional locked-room hide."""
+    shown = spots_passing_price(spots, allowed_ids)
+    if hide_locked and locked_ids:
+        shown = [spot for spot in shown if spot.id not in locked_ids]
+    return shown
 
 
 def items_at_spot(

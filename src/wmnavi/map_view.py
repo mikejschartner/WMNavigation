@@ -7,22 +7,24 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PySide6.QtSvgWidgets import QGraphicsSvgItem
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
     QGraphicsItemGroup,
     QGraphicsLineItem,
+    QGraphicsPathItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
 )
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QTransform, QWheelEvent
 
 from .coords import PlayerState, crs_bounds_from_map, game_to_map
 from .floors import FloorOption, marker_on_floor
-from .loot_filter import best_item_at_spot, spot_is_super_rare, spots_passing_price
+from .loot_filter import best_item_at_spot, filter_spots, spot_is_super_rare
+from .locks import door_locks, lock_key_name
 from .marker_icons import (
     extract_label_color,
     get_container_icon,
@@ -53,6 +55,7 @@ class LayerVisibility:
     switches: bool = False
     stationary_weapons: bool = False
     item_hunt: bool = False
+    show_locked_doors: bool = False
 
 
 class PlayerMarker(QGraphicsPixmapItem):
@@ -111,7 +114,7 @@ class MapView(QGraphicsView):
     marker_clicked = Signal(str, object, object)
 
     MIN_ZOOM = 0.2
-    MAX_ZOOM = 120.0
+    MAX_ZOOM = 400.0
 
     def __init__(self):
         super().__init__()
@@ -148,8 +151,11 @@ class MapView(QGraphicsView):
         self._quest_spots: list[MapPoint] = []
         self._friend_pings: list = []
         self._haze_off_floor = True
+        self._hide_locked_room_loot = False
+        self._locked_loot_ids: set[str] = set()
         self._marker_items: list[QGraphicsItem] = []
         self._friend_items: list[QGraphicsItem] = []
+        self._route_items: list[QGraphicsItem] = []
         self._marker_scale = 0.85
         self._refreshing = False
         # Small screen-space marker so the black dot stays precise while zooming.
@@ -456,15 +462,21 @@ class MapView(QGraphicsView):
         hide_loose_stars: bool = False,
         quest_spots: list[MapPoint] | None = None,
         haze_off_floor: bool = True,
+        hide_locked_room_loot: bool = False,
+        locked_loot_ids: set[str] | None = None,
+        show_locked_doors: bool = False,
     ):
         """Update visibility + hunt + price filter and redraw once."""
         self._visibility = visibility
         self._selected_item_ids = set(selected_ids)
         self._visibility.item_hunt = visibility.item_hunt
+        self._visibility.show_locked_doors = bool(show_locked_doors or visibility.show_locked_doors)
         self._price_filter_ids = None if price_filter_ids is None else set(price_filter_ids)
         self._hide_loose_stars = hide_loose_stars
         self._quest_spots = list(quest_spots or [])
         self._haze_off_floor = haze_off_floor
+        self._hide_locked_room_loot = hide_locked_room_loot
+        self._locked_loot_ids = set(locked_loot_ids or [])
         self.refresh_layers()
 
     def _clear_friends(self):
@@ -629,10 +641,16 @@ class MapView(QGraphicsView):
 
             # Loose loot stars AND item-hunt icons only when the Loose loot layer is on.
             if vis.loose_loot:
+                locked = self._locked_loot_ids if self._hide_locked_room_loot else set()
                 if not self._hide_loose_stars:
                     normal_icon = get_loose_loot_icon(loose_px, rare=False)
                     rare_icon = get_loose_loot_icon(loose_px, rare=True)
-                    for spot in spots_passing_price(data.loose_loot, self._price_filter_ids):
+                    for spot in filter_spots(
+                        data.loose_loot,
+                        allowed_ids=self._price_filter_ids,
+                        hide_locked=self._hide_locked_room_loot,
+                        locked_ids=locked,
+                    ):
                         rare = spot_is_super_rare(spot, self._map_items, self._price_filter_ids)
                         self._add_marker(rare_icon if rare else normal_icon, spot, "loose_loot")
 
@@ -640,6 +658,8 @@ class MapView(QGraphicsView):
                 if vis.item_hunt and self._selected_item_ids:
                     hunt_pix_cache: dict[str, object] = {}
                     for spot in data.loose_loot:
+                        if locked and spot.id in locked:
+                            continue
                         best = best_item_at_spot(
                             spot,
                             self._selected_item_ids,
@@ -687,7 +707,18 @@ class MapView(QGraphicsView):
                 for spot in data.transits:
                     self._add_marker(icon, spot, "transit", label=spot.label, label_kind="transit")
 
-            if vis.locks:
+            if vis.show_locked_doors:
+                icon = get_usable_icon("lock", usable_px)
+                doors = {id(p) for p in door_locks(data.locks)}
+                for spot in door_locks(data.locks):
+                    name = lock_key_name(spot)
+                    self._add_marker(icon, spot, "lock", label=name, label_kind="lock")
+                if vis.locks:
+                    for spot in data.locks:
+                        if id(spot) in doors:
+                            continue
+                        self._add_marker(icon, spot, "lock")
+            elif vis.locks:
                 icon = get_usable_icon("lock", usable_px)
                 for spot in data.locks:
                     self._add_marker(icon, spot, "lock")
@@ -721,6 +752,65 @@ class MapView(QGraphicsView):
         finally:
             self._refreshing = False
 
+    def set_route(
+        self,
+        waypoints: list[tuple[float, float, float]] | None,
+        color: str = "#a855f7",
+        stops: list | None = None,
+    ):
+        """Draw a planned route in scene space. Independent of layer marker refresh."""
+        self.clear_route()
+        if not waypoints or len(waypoints) < 2:
+            return
+        path = QPainterPath()
+        mapped: list[QPointF] = []
+        for x, _y, z in waypoints:
+            mx, my = game_to_map(x, z, self.map_rotation, self.map_transform)
+            mapped.append(QPointF(mx, my))
+        path.moveTo(mapped[0])
+        for pt in mapped[1:]:
+            path.lineTo(pt)
+        item = QGraphicsPathItem(path)
+        pen = QPen(QColor(color), 2.6)
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        item.setPen(pen)
+        item.setZValue(400)
+        item.setOpacity(0.88)
+        self.scene.addItem(item)
+        self._route_items.append(item)
+        for i, pt in enumerate(mapped):
+            if i == 0 or i == len(mapped) - 1:
+                continue
+            if i % max(1, len(mapped) // 24) != 0:
+                continue
+            dot = QGraphicsEllipseItem(-2.2, -2.2, 4.4, 4.4)
+            dot.setBrush(QBrush(QColor(color)))
+            dot.setPen(QPen(QColor("#0a0a0f"), 0.6))
+            dot.setPos(pt)
+            dot.setZValue(401)
+            self.scene.addItem(dot)
+            self._route_items.append(dot)
+        for stop in stops or []:
+            kind = getattr(stop, "kind", "")
+            if kind not in {"quest", "loot", "extract"}:
+                continue
+            mx, my = game_to_map(stop.x, stop.z, self.map_rotation, self.map_transform)
+            ring = QGraphicsEllipseItem(-5, -5, 10, 10)
+            ring.setBrush(QBrush(QColor(color).lighter(130)))
+            ring.setPen(QPen(QColor(color), 1.4))
+            ring.setPos(mx, my)
+            ring.setZValue(402)
+            self.scene.addItem(ring)
+            self._route_items.append(ring)
+
+    def clear_route(self):
+        for item in self._route_items:
+            if item.scene():
+                self.scene.removeItem(item)
+        self._route_items.clear()
+
     def _find_marker_item(self, item: QGraphicsItem | None) -> MapMarkerItem | None:
         while item:
             if isinstance(item, MapMarkerItem):
@@ -740,8 +830,12 @@ class MapView(QGraphicsView):
         if self.player.isVisible():
             self.centerOn(self.player)
 
-    def focus_around_player(self, fraction: float = 0.14):
-        """Center + zoom so a fraction of the map around the player fills the view."""
+    def focus_around_player(self, fraction: float = 0.14, radius_m: float | None = None):
+        """Center + zoom the overlay around the player.
+
+        Prefer radius_m (game meters) so large maps still get a close overlay.
+        Fraction is only used when the map has no transform scale.
+        """
         if self.crs_bounds:
             min_x, max_x, min_y, max_y = self.crs_bounds
             span = max(max_x - min_x, max_y - min_y, 1.0)
@@ -761,7 +855,17 @@ class MapView(QGraphicsView):
             else:
                 pos = self.scene.sceneRect().center()
 
-        radius = span * max(0.03, min(0.55, float(fraction)))
+        radius = None
+        if radius_m is not None and self.map_transform and len(self.map_transform) >= 3:
+            try:
+                scale_x = abs(float(self.map_transform[0]))
+                scale_z = abs(float(self.map_transform[2]))
+                scale = max((scale_x + scale_z) / 2.0, 0.01)
+                radius = max(4.0, float(radius_m) * scale)
+            except (TypeError, ValueError):
+                radius = None
+        if radius is None:
+            radius = span * max(0.003, min(0.55, float(fraction)))
         area = QRectF(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
         # resetTransform is required — fitInView alone often no-ops when already zoomed.
         self.resetTransform()
