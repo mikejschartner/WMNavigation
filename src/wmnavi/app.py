@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
         self._sync_live_timer()
         self._select_map_combo(self.current_map_slug)
         self._update_price_labels()
-        QTimer.singleShot(1500, self.check_for_updates)
+        QTimer.singleShot(2500, self.check_for_updates)
 
     def _update_marker_scale_label(self):
         scale = self.marker_scale_slider.value() / 100.0
@@ -624,36 +624,34 @@ class MainWindow(QMainWindow):
             return
 
         remote = info["version"]
-        # Packaged builds: apply automatically. Dev/source: keep Yes/No prompt.
+        notes = (info.get("releaseNotes") or "").strip()
+        msg = (
+            f"WMNavigation {remote} is available "
+            f"(you have {__version__}).\n\n"
+            "The app will close and reopen on the new version."
+        )
+        if notes:
+            msg += f"\n\n{notes[:400]}"
+        # Frozen builds used to download+quit with no dialog, which looks like a crash
+        # when OneDrive locks the exe and the restart never happens.
         auto_apply = is_frozen()
         if not auto_apply:
-            notes = (info.get("releaseNotes") or "").strip()
-            msg = (
-                f"WMNavigation {remote} is available "
-                f"(you have {__version__}).\n\nUpdate now?"
-            )
-            if notes:
-                msg += f"\n\n{notes[:400]}"
             reply = QMessageBox.question(
                 self,
                 "Update available",
-                msg,
+                msg + "\n\nUpdate now?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
                 self.status_label.setText("Ready")
                 return
+        else:
+            QMessageBox.information(self, "Updating", msg)
 
         self.status_label.setText(f"Updating to v{remote}…")
         try:
             apply_update(info["downloadUrl"])
-            if not auto_apply:
-                QMessageBox.information(
-                    self,
-                    "Updating",
-                    "Update downloaded. WMNavigation will restart to finish installing.",
-                )
-            QApplication.instance().quit()
+            QTimer.singleShot(400, QApplication.instance().quit)
         except Exception as exc:
             self.status_label.setText("Update failed")
             QMessageBox.warning(self, "Update failed", str(exc))
@@ -2034,8 +2032,9 @@ def run():
     from pathlib import Path
 
     crash_path = Path.home() / "Desktop" / "WMNavigation_crash.log"
-    # OneDrive Desktop fallback
     desk2 = Path.home() / "OneDrive" / "Desktop" / "WMNavigation_crash.log"
+    fault_path = Path.home() / "AppData" / "Local" / "WMNavigation" / "fault.log"
+    fault_path.parent.mkdir(parents=True, exist_ok=True)
 
     def _log_crash(text: str):
         for path in (crash_path, desk2):
@@ -2046,7 +2045,7 @@ def run():
                 pass
 
     try:
-        fault_file = (crash_path if crash_path.parent.exists() else desk2).open("a", encoding="utf-8")
+        fault_file = fault_path.open("a", encoding="utf-8")
         faulthandler.enable(file=fault_file, all_threads=True)
     except Exception:
         try:

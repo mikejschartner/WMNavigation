@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import requests
@@ -93,7 +92,6 @@ def check_for_update(timeout: float = 8.0) -> dict | None:
         url = str(info.get("downloadUrl") or "")
         notes = str(info.get("releaseNotes") or "")
 
-    # latest.json missing, or missing version/url — fill from Releases API.
     if not remote or not url:
         api_info = _fetch_releases_api(timeout)
         if not api_info:
@@ -114,42 +112,59 @@ def check_for_update(timeout: float = 8.0) -> dict | None:
 
 
 def apply_update(download_url: str) -> Path | None:
-    """Download new exe and schedule replace+restart. Returns updater script path."""
-    if not is_frozen():
-        # Dev mode: just download beside project for manual swap.
-        target = Path.cwd() / "WMNavigation_update.exe"
-    else:
+    """Download the new exe next to the running app, then replace+restart after exit."""
+    if is_frozen():
         target = Path(sys.executable).resolve()
+    else:
+        target = Path.cwd() / "WMNavigation.exe"
+
+    dest_dir = target.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    staged = dest_dir / "WMNavigation_new.exe"
 
     headers = {"User-Agent": f"WMNavigation/{__version__}"}
     resp = requests.get(download_url, timeout=120, headers=headers, stream=True)
     resp.raise_for_status()
-    tmp = Path(tempfile.gettempdir()) / f"WMNavigation_update_{os.getpid()}.exe"
-    with tmp.open("wb") as fh:
+    with staged.open("wb") as fh:
         for chunk in resp.iter_content(chunk_size=1024 * 256):
             if chunk:
                 fh.write(chunk)
 
-    if tmp.stat().st_size < 1_000_000:
-        tmp.unlink(missing_ok=True)
+    if staged.stat().st_size < 1_000_000:
+        staged.unlink(missing_ok=True)
         raise RuntimeError("Downloaded update looks too small")
 
-    bat = Path(tempfile.gettempdir()) / f"wmnavi_apply_update_{os.getpid()}.bat"
-    # Wait for this process to exit, replace exe, relaunch.
+    bat = dest_dir / "wmnavi_apply_update.bat"
+    pid = os.getpid()
     bat.write_text(
         "\r\n".join(
             [
                 "@echo off",
+                "setlocal",
+                f'set "TARGET={target}"',
+                f'set "STAGED={staged}"',
                 "timeout /t 2 /nobreak >nul",
-                ":loop",
-                f'tasklist /FI "PID eq {os.getpid()}" | find "{os.getpid()}" >nul',
+                ":wait",
+                f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul',
                 "if not errorlevel 1 (",
                 "  timeout /t 1 /nobreak >nul",
-                "  goto loop",
+                "  goto wait",
                 ")",
-                f'copy /Y "{tmp}" "{target}" >nul',
-                f'start "" "{target}"',
-                f'del "{tmp}" >nul 2>&1',
+                "set /a N=0",
+                ":retry",
+                "set /a N+=1",
+                'copy /Y "%STAGED%" "%TARGET%" >nul 2>&1',
+                "if not errorlevel 1 goto launch_target",
+                "if %N% LSS 15 (",
+                "  timeout /t 1 /nobreak >nul",
+                "  goto retry",
+                ")",
+                'start "" "%STAGED%"',
+                "goto done",
+                ":launch_target",
+                'start "" "%TARGET%"',
+                'del "%STAGED%" >nul 2>&1',
+                ":done",
                 'del "%~f0" >nul 2>&1',
                 "",
             ]
@@ -158,7 +173,7 @@ def apply_update(download_url: str) -> Path | None:
     )
     subprocess.Popen(
         ["cmd", "/c", str(bat)],
-        cwd=str(target.parent),
+        cwd=str(dest_dir),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
         | getattr(subprocess, "DETACHED_PROCESS", 0),
         close_fds=True,

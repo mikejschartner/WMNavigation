@@ -785,6 +785,10 @@ class MapView(QGraphicsView):
                         label=tip,
                     )
             self._redraw_friends()
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
         finally:
             self._refreshing = False
 
