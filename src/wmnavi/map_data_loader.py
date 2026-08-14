@@ -9,6 +9,7 @@ import requests
 
 from .coords import point_in_crs_bounds
 from .locks import resolve_lock_label
+from .loot_loader import _item_from_raw, _load_items_dump, _spot_from_dict, _spot_to_dict
 from .models import ContainerTypeInfo, ItemInfo, LootSpot, MapLayerData, MapPoint
 from .paths import cache_dir
 from .questie_source import find_map_entry, load_questie_labels, resolve_label

@@ -682,7 +682,10 @@ class MainWindow(QMainWindow):
     def on_mode_changed(self, label: str):
         self.current_game_mode = GAME_MODES.get(label, "regular")
         self.settings.setValue("game_mode", self.current_game_mode)
-        self.load_map(self.current_map_slug, force_fetch=False)
+        try:
+            self.load_map(self.current_map_slug, force_fetch=False)
+        except Exception as exc:
+            self.status_label.setText(f"Map load failed: {exc}")
 
     def _update_price_labels(self):
         self.price_value.setText(f"₽{self.price_slider.value():,}")
