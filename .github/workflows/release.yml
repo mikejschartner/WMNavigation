@@ -21,6 +21,11 @@ jobs:
         run: |
           pip install -r requirements.txt pyinstaller pillow
 
+      - name: Smoke test launch
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/smoke_test.py
+
       - name: Build WMNavigation.exe
         run: pyinstaller build.spec
 

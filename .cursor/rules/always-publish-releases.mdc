@@ -1,19 +1,20 @@
 ---
-description: Always publish a GitHub release after shipping user-facing changes
+description: Always smoke-test then publish a GitHub release after shipping user-facing changes
 alwaysApply: true
 ---
 
-# Always ship live
+# Always ship live — after it actually opens
 
-After finishing user-facing work, publish it. Do not wait to be asked whether it is live.
+Never tag or publish a build that has not passed `python scripts/smoke_test.py`. That is why past releases crashed: they were shipped untested.
 
-1. Bump `src/wmnavi/__init__.py` (patch: 0.6.x).
-2. Commit with `Release 0.6.x: …` (why, not file list).
-3. Push `main`.
-4. Tag `v0.6.x` and push the tag.
-5. Build with `pyinstaller build.spec --noconfirm`.
-6. Write `dist/latest.json` and `gh release create` with `dist/WMNavigation.exe` + `dist/latest.json` as latest.
+After user-facing work:
 
-Do not commit the exe. Do not force-push. If GitHub Actions also builds the tag, still publish locally when CI fails (Pillow/icon). Use Visual Studio `git.exe` if `git` is not on PATH.
+1. Run `python scripts/smoke_test.py` (must print `SMOKE OK`). If it fails, fix it. Do not tag.
+2. Bump `src/wmnavi/__init__.py` (patch: 0.6.x).
+3. Commit with `Release 0.6.x: …`.
+4. Push `main`, tag `v0.6.x`, push the tag.
+5. GitHub Actions builds the exe only after the same smoke test. If CI fails, fix and ship a new version — do not tell the user it is live.
+
+Do not commit the exe. Do not force-push.
 
 Git: `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe`
