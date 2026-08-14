@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +12,6 @@ from PySide6.QtSvgWidgets import QGraphicsSvgItem
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
     QGraphicsItem,
-    QGraphicsItemGroup,
     QGraphicsLineItem,
     QGraphicsPathItem,
     QGraphicsPixmapItem,
@@ -30,7 +30,6 @@ from .marker_icons import (
     get_container_icon,
     get_extract_icon,
     get_item_hunt_marker,
-    get_location_pin,
     get_loose_loot_icon,
     get_quest_marker,
     get_usable_icon,
@@ -100,13 +99,43 @@ class MapMarkerItem(QGraphicsPixmapItem):
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
 
 
-class ScreenAnchor(QGraphicsItemGroup):
-    """Map-anchored group whose children are drawn in screen pixels."""
+def _cluster_pixel_offsets(n: int) -> list[tuple[int, int]]:
+    """Screen-pixel ring offsets so stacked spawns stay readable."""
+    if n <= 1:
+        return [(0, 0)]
+    out: list[tuple[int, int]] = []
+    ring = 0
+    while len(out) < n:
+        ring += 1
+        count = min(n - len(out), 6 * ring)
+        radius = 12 * ring
+        for i in range(count):
+            ang = (2 * math.pi * i / count) - math.pi / 2
+            out.append((int(round(radius * math.cos(ang))), int(round(radius * math.sin(ang)))))
+    return out
 
-    def __init__(self):
-        super().__init__()
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        self.setHandlesChildEvents(False)
+
+def _parse_svg_viewbox(path: str | None) -> QRectF | None:
+    """Read the SVG viewBox so map art is fitted to the authored frame, not a tight crop."""
+    if not path:
+        return None
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="ignore")[:16000]
+    except OSError:
+        return None
+    match = re.search(r"viewBox\s*=\s*[\"']([^\"']+)[\"']", text, re.I)
+    if not match:
+        return None
+    parts = match.group(1).replace(",", " ").split()
+    if len(parts) != 4:
+        return None
+    try:
+        x, y, w, h = (float(p) for p in parts)
+    except ValueError:
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return QRectF(x, y, w, h)
 
 
 class MapView(QGraphicsView):
@@ -251,15 +280,11 @@ class MapView(QGraphicsView):
             self.map_item.setZValue(0)
             self.map_item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
             self.scene.addItem(self.map_item)
-            svg_rect = self.map_item.boundingRect()
             if transform and bounds:
-                sx = (max_x - min_x) / svg_rect.width() if svg_rect.width() else 1.0
-                sy = (max_y - min_y) / svg_rect.height() if svg_rect.height() else 1.0
-                self.map_item.setTransform(QTransform.fromScale(sx, sy))
-                self.map_item.setPos(min_x, min_y)
+                self._place_map_art(self.map_item, svg_path)
             else:
                 self.crs_bounds = None
-                self.scene.setSceneRect(svg_rect)
+                self.scene.setSceneRect(self.map_item.boundingRect())
             used_svg = True
 
         if not used_svg and map_meta and self.crs_bounds and map_meta.get("tilePath"):
@@ -287,6 +312,30 @@ class MapView(QGraphicsView):
         self._apply_floor_visual()
         self.refresh_layers()
 
+    def _art_crs_bounds(self) -> tuple[float, float, float, float] | None:
+        """CRS rectangle the SVG/tiles were authored against (svgBounds when present)."""
+        meta = self._map_meta or {}
+        bounds = meta.get("svgBounds") or self.map_bounds
+        if bounds and self.map_transform:
+            return crs_bounds_from_map(bounds, self.map_rotation, self.map_transform)
+        return self.crs_bounds
+
+    def _place_map_art(self, item: QGraphicsItem, svg_path: str | None = None):
+        """Stretch map art so its viewBox lands on the same CRS markers use."""
+        art = self._art_crs_bounds()
+        if not art:
+            return
+        min_x, max_x, min_y, max_y = art
+        rect = _parse_svg_viewbox(svg_path)
+        if rect is None:
+            rect = item.boundingRect()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+        sx = (max_x - min_x) / rect.width()
+        sy = (max_y - min_y) / rect.height()
+        item.setTransform(QTransform.fromScale(sx, sy))
+        item.setPos(min_x - rect.x() * sx, min_y - rect.y() * sy)
+
     def _floor_cache_key(self) -> str:
         floor = self._floor
         return f"{self._map_slug}|{floor.label}|{floor.svg_layer}|{floor.kind}"
@@ -302,13 +351,8 @@ class MapView(QGraphicsView):
             item.setPos(old.pos())
             if old.scene():
                 self.scene.removeItem(old)
-        elif self.crs_bounds:
-            min_x, max_x, min_y, max_y = self.crs_bounds
-            svg_rect = item.boundingRect()
-            sx = (max_x - min_x) / svg_rect.width() if svg_rect.width() else 1.0
-            sy = (max_y - min_y) / svg_rect.height() if svg_rect.height() else 1.0
-            item.setTransform(QTransform.fromScale(sx, sy))
-            item.setPos(min_x, min_y)
+        else:
+            self._place_map_art(item, path)
         self.scene.addItem(item)
         self.map_item = item
 
@@ -495,31 +539,32 @@ class MapView(QGraphicsView):
             opacity = 1.0 if on_floor else 0.35
             color = getattr(ping, "color", None) or "#38bdf8"
             pix = load_friend_marker_pixmap(self._px(28), color=color)
-            group = ScreenAnchor()
             marker = QGraphicsPixmapItem(pix)
+            marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             marker.setOffset(-pix.width() / 2, -pix.height() / 2)
             marker.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
             marker.setRotation(float(getattr(ping, "yaw_deg", 0)) + self.map_rotation)
-            marker.setToolTip(
-                f"{ping.name}\nFacing {float(getattr(ping, 'yaw_deg', 0)):.0f}°"
-            )
-            group.addToGroup(marker)
+            marker.setPos(mx, my)
+            marker.setZValue(1900)
+            marker.setOpacity(opacity)
+            marker.setToolTip(f"{ping.name}\nFacing {float(getattr(ping, 'yaw_deg', 0)):.0f}°")
+            self.scene.addItem(marker)
+            self._friend_items.append(marker)
 
             text = QGraphicsSimpleTextItem(str(ping.name))
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             text.setBrush(QBrush(QColor(color)))
             text.setPen(QPen(QColor("#0a0a0f"), 1))
             font = QFont("Segoe UI", max(8, self._px(9)))
             font.setBold(True)
             text.setFont(font)
             br = text.boundingRect()
-            text.setPos(-br.width() / 2, pix.height() / 2 + 2)
-            group.addToGroup(text)
-
-            group.setPos(mx, my)
-            group.setZValue(1900)
-            group.setOpacity(opacity)
-            self.scene.addItem(group)
-            self._friend_items.append(group)
+            text.setPos(mx, my)
+            text.setTransform(QTransform.fromTranslate(-br.width() / 2, pix.height() / 2 + 2))
+            text.setZValue(1901)
+            text.setOpacity(opacity)
+            self.scene.addItem(text)
+            self._friend_items.append(text)
 
     def _on_active_floor(self, y: float) -> bool:
         if self._floor.label.lower() == "all floors":
@@ -539,6 +584,7 @@ class MapView(QGraphicsView):
         item: ItemInfo | None = None,
         label: str = "",
         label_kind: str | None = None,
+        pixel_offset: tuple[int, int] = (0, 0),
     ):
         mx, my, y = self._scene_pos(point)
         on_floor = self._on_active_floor(y)
@@ -549,15 +595,26 @@ class MapView(QGraphicsView):
             return
         opacity = 1.0 if on_floor else 0.28
         tooltip = label or (point.label if isinstance(point, MapPoint) else kind)
-        if label_kind:
-            group = ScreenAnchor()
-            marker = MapMarkerItem(pix, point, kind, item)
-            marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, False)
-            marker.setPos(0, 0)
-            marker.setToolTip(tooltip)
-            group.addToGroup(marker)
+        if kind == "item_hunt" and item is not None:
+            tooltip = f"{item.name}\n₽{item.best_price:,}"
 
+        # Every marker kind is a single pixmap glued to the loot/extract coordinate.
+        # Do not parent them under ScreenAnchor — child setPos offsets were scaled by
+        # zoom and landed in the wrong rooms on every map.
+        marker = MapMarkerItem(pix, point, kind, item)
+        ox, oy = pixel_offset
+        marker.setOffset(-pix.width() / 2 + ox, -pix.height() / 2 + oy)
+        marker.setPos(mx, my)
+        marker.setToolTip(tooltip)
+        marker.setOpacity(opacity)
+        if kind == "quest":
+            marker.setZValue(750)
+        self.scene.addItem(marker)
+        self._marker_items.append(marker)
+
+        if label:
             text = QGraphicsSimpleTextItem(label)
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             color = extract_label_color(label_kind or kind)
             text.setBrush(QBrush(color))
             text.setPen(QPen(QColor("#0a0a0f"), 1))
@@ -566,57 +623,17 @@ class MapView(QGraphicsView):
             text.setFont(font)
             text.setToolTip(tooltip)
             br = text.boundingRect()
-            text.setPos(-br.width() / 2, -pix.height() / 2 - br.height() - 2)
-            group.addToGroup(text)
-
-            group.setPos(mx, my)
-            group.setZValue(650)
-            group.setOpacity(opacity)
-            self.scene.addItem(group)
-            self._marker_items.append(group)
-            return
-
-        if kind == "item_hunt" and item is not None:
-            group = ScreenAnchor()
-            pin = MapMarkerItem(get_location_pin("#c084fc", self._px(7)), point, kind, item)
-            pin.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, False)
-            pin.setPos(0, 0)
-            pin.setToolTip(tooltip)
-            group.addToGroup(pin)
-
-            marker = MapMarkerItem(pix, point, kind, item)
-            marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, False)
-            marker.setPos(0, -pix.height() / 2 - 5)
-            marker.setToolTip(tooltip)
-            group.addToGroup(marker)
-
-            group.setPos(mx, my)
-            group.setZValue(700)
-            group.setOpacity(opacity)
-            self.scene.addItem(group)
-            self._marker_items.append(group)
-            return
-
-        if kind == "quest":
-            group = ScreenAnchor()
-            marker = MapMarkerItem(pix, point, kind, item)
-            marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, False)
-            marker.setPos(0, 0)
-            marker.setToolTip(tooltip)
-            group.addToGroup(marker)
-            group.setPos(mx, my)
-            group.setZValue(750)
-            group.setOpacity(opacity)
-            self.scene.addItem(group)
-            self._marker_items.append(group)
-            return
-
-        marker = MapMarkerItem(pix, point, kind, item)
-        marker.setPos(mx, my)
-        marker.setToolTip(tooltip)
-        marker.setOpacity(opacity)
-        self.scene.addItem(marker)
-        self._marker_items.append(marker)
+            text.setPos(mx, my)
+            text.setTransform(
+                QTransform.fromTranslate(
+                    -br.width() / 2 + ox,
+                    -pix.height() / 2 - br.height() - 2 + oy,
+                )
+            )
+            text.setZValue(650)
+            text.setOpacity(opacity)
+            self.scene.addItem(text)
+            self._marker_items.append(text)
 
     def clear_markers(self):
         for item in self._marker_items:
@@ -639,47 +656,66 @@ class MapView(QGraphicsView):
             usable_px = self._px(12)
             loose_px = self._px(10)
 
-            # Loose loot stars AND item-hunt icons only when the Loose loot layer is on.
-            if vis.loose_loot:
+            # Loose loot stars when the layer is on and we are not in "only selected" mode.
+            if vis.loose_loot and not self._hide_loose_stars:
                 locked = self._locked_loot_ids if self._hide_locked_room_loot else set()
-                if not self._hide_loose_stars:
-                    normal_icon = get_loose_loot_icon(loose_px, rare=False)
-                    rare_icon = get_loose_loot_icon(loose_px, rare=True)
-                    for spot in filter_spots(
-                        data.loose_loot,
-                        allowed_ids=self._price_filter_ids,
-                        hide_locked=self._hide_locked_room_loot,
-                        locked_ids=locked,
-                    ):
-                        rare = spot_is_super_rare(spot, self._map_items, self._price_filter_ids)
-                        self._add_marker(rare_icon if rare else normal_icon, spot, "loose_loot")
+                normal_icon = get_loose_loot_icon(loose_px, rare=False)
+                rare_icon = get_loose_loot_icon(loose_px, rare=True)
+                for spot in filter_spots(
+                    data.loose_loot,
+                    allowed_ids=self._price_filter_ids,
+                    hide_locked=self._hide_locked_room_loot,
+                    locked_ids=locked,
+                ):
+                    rare = spot_is_super_rare(spot, self._map_items, self._price_filter_ids)
+                    self._add_marker(rare_icon if rare else normal_icon, spot, "loose_loot")
 
-                # Category toggles and/or selected item hunt — show by item icon.
-                if vis.item_hunt and self._selected_item_ids:
-                    hunt_pix_cache: dict[str, object] = {}
-                    for spot in data.loose_loot:
-                        if locked and spot.id in locked:
-                            continue
-                        best = best_item_at_spot(
-                            spot,
-                            self._selected_item_ids,
-                            self._map_items,
+            # Selected / category item icons — independent of the Loose loot star layer.
+            if vis.item_hunt and self._selected_item_ids:
+                locked = self._locked_loot_ids if self._hide_locked_room_loot else set()
+                hunt_pix_cache: dict[str, object] = {}
+                hunt_rows: list[tuple[LootSpot, ItemInfo, object]] = []
+                for spot in data.loose_loot:
+                    if locked and spot.id in locked:
+                        continue
+                    best = best_item_at_spot(
+                        spot,
+                        self._selected_item_ids,
+                        self._map_items,
+                    )
+                    if not best:
+                        continue
+                    if (
+                        self._price_filter_ids is not None
+                        and not self._hide_loose_stars
+                        and best.id not in self._price_filter_ids
+                    ):
+                        continue
+                    pix = hunt_pix_cache.get(best.id)
+                    if pix is None:
+                        pix = get_item_hunt_marker(
+                            best.id,
+                            best.short_name,
+                            best.icon_url,
+                            item_px,
+                            item_name=best.name,
                         )
-                        if not best:
-                            continue
-                        if self._price_filter_ids is not None and best.id not in self._price_filter_ids:
-                            continue
-                        pix = hunt_pix_cache.get(best.id)
-                        if pix is None:
-                            pix = get_item_hunt_marker(
-                                best.id,
-                                best.short_name,
-                                best.icon_url,
-                                item_px,
-                                item_name=best.name,
-                            )
-                            hunt_pix_cache[best.id] = pix
-                        self._add_marker(pix, spot, "item_hunt", best)
+                        hunt_pix_cache[best.id] = pix
+                    hunt_rows.append((spot, best, pix))
+
+                buckets: dict[tuple[int, int], list[int]] = {}
+                for i, (spot, _best, _pix) in enumerate(hunt_rows):
+                    mx, my, _y = self._scene_pos(spot)
+                    key = (int(round(mx)), int(round(my)))
+                    buckets.setdefault(key, []).append(i)
+                offsets = [(0, 0)] * len(hunt_rows)
+                for idxs in buckets.values():
+                    spread = _cluster_pixel_offsets(len(idxs))
+                    for j, idx in enumerate(idxs):
+                        offsets[idx] = spread[j]
+
+                for (spot, best, pix), offset in zip(hunt_rows, offsets):
+                    self._add_marker(pix, spot, "item_hunt", best, pixel_offset=offset)
 
             container_ids = vis.container_ids or set()
             for cid in container_ids:

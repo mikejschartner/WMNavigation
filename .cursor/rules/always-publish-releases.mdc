@@ -1,0 +1,19 @@
+---
+description: Always publish a GitHub release after shipping user-facing changes
+alwaysApply: true
+---
+
+# Always ship live
+
+After finishing user-facing work, publish it. Do not wait to be asked whether it is live.
+
+1. Bump `src/wmnavi/__init__.py` (patch: 0.6.x).
+2. Commit with `Release 0.6.x: …` (why, not file list).
+3. Push `main`.
+4. Tag `v0.6.x` and push the tag.
+5. Build with `pyinstaller build.spec --noconfirm`.
+6. Write `dist/latest.json` and `gh release create` with `dist/WMNavigation.exe` + `dist/latest.json` as latest.
+
+Do not commit the exe. Do not force-push. If GitHub Actions also builds the tag, still publish locally when CI fails (Pillow/icon). Use Visual Studio `git.exe` if `git` is not on PATH.
+
+Git: `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe`

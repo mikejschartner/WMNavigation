@@ -1,4 +1,4 @@
-"""Item filter modal with Questie-style icon rows."""
+"""Item filter modal: every map item, expensive first, toggle what appears on the map."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from .icon_cache import get_item_icon
+from .loot_filter import item_best_price
 from .models import ItemInfo
 
 
@@ -25,8 +26,8 @@ class ItemFilterDialog(QDialog):
 
     def __init__(self, map_items: dict[str, ItemInfo], selected: set[str], parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Filter Loot Items")
-        self.resize(480, 640)
+        self.setWindowTitle("Filter Items")
+        self.resize(560, 720)
         self.setModal(True)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.map_items = map_items
@@ -35,6 +36,11 @@ class ItemFilterDialog(QDialog):
         self._icon_queue: list[tuple[str, QCheckBox, str]] = []
 
         layout = QVBoxLayout(self)
+
+        hint = QLabel("All loot on this map, highest value first. Check items to show their spawn locations.")
+        hint.setObjectName("status")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
 
         top = QHBoxLayout()
         top.addWidget(QLabel("Search:"))
@@ -79,19 +85,24 @@ class ItemFilterDialog(QDialog):
         QTimer.singleShot(0, self._load_icons_batch)
 
     def _populate(self):
-        for iid, item in sorted(self.map_items.values(), key=lambda i: i.name.lower()):
-            row = QCheckBox(f"  {item.name}")
-            row.setChecked(iid in self.selected)
+        ordered = sorted(
+            self.map_items.values(),
+            key=lambda item: (-item_best_price(item), item.name.lower()),
+        )
+        for item in ordered:
+            price = item_best_price(item)
+            row = QCheckBox(f"₽{price:,}   {item.name}")
+            row.setChecked(item.id in self.selected)
             row.setIconSize(QSize(32, 32))
-            row.setProperty("item_id", iid)
-            row.setProperty("item_name", item.name.lower())
+            row.setProperty("item_id", item.id)
+            row.setProperty("item_name", f"{item.name} {item.short_name}".lower())
             row.setToolTip(
-                f"{item.name}\n{item.short_name}\nBest: ₽{item.best_price:,}\n"
-                f"Flea: ₽{item.flea_price:,}\nTrader: ₽{item.trader_price:,}"
+                f"{item.name}\n{item.short_name}\n"
+                f"Best: ₽{price:,}\nFlea: ₽{item.flea_price:,}\nTrader: ₽{item.trader_price:,}"
             )
             row.stateChanged.connect(self._update_footer)
-            self.rows[iid] = row
-            self._icon_queue.append((iid, row, item.icon_url))
+            self.rows[item.id] = row
+            self._icon_queue.append((item.id, row, item.icon_url))
             self.list_layout.addWidget(row)
         self.list_layout.addStretch(1)
         self._apply_filter()
@@ -116,7 +127,7 @@ class ItemFilterDialog(QDialog):
             row.setVisible(show)
             if show:
                 visible += 1
-        self.count_label.setText(f"{visible} items on this map")
+        self.count_label.setText(f"{visible} items · sorted by max price")
 
     def _select_all_visible(self):
         for row in self.rows.values():

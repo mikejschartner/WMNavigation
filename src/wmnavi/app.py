@@ -340,17 +340,23 @@ class MainWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         self.btn_filter = QPushButton("Filter Items...")
+        self.btn_filter.setToolTip(
+            "Open every item on this map, sorted by value. Check what you want on the map."
+        )
         self.btn_filter.clicked.connect(self.open_item_filter)
         btn_row.addWidget(self.btn_filter)
+        self.chk_item_hunt = QCheckBox("Only selected")
+        self.chk_item_hunt.setToolTip(
+            "When checked, the map shows only the items you ticked in Filter Items."
+        )
+        self.chk_item_hunt.setChecked(self.settings.value("only_selected_loot", False, type=bool))
+        self.chk_item_hunt.stateChanged.connect(self.on_only_selected_changed)
+        btn_row.addWidget(self.chk_item_hunt)
         self.btn_select_filtered = QPushButton("Select Filtered")
+        self.btn_select_filtered.setToolTip("Select every item that currently passes the min-price filter.")
         self.btn_select_filtered.clicked.connect(self.select_all_filtered)
         btn_row.addWidget(self.btn_select_filtered)
         bottom_layout.addLayout(btn_row)
-
-        self.chk_item_hunt = QCheckBox("Show selected items on map")
-        self.chk_item_hunt.setChecked(self.settings.value("item_hunt_enabled", True, type=bool))
-        self.chk_item_hunt.stateChanged.connect(self.refresh_map_layers)
-        bottom_layout.addWidget(self.chk_item_hunt)
 
         self.chk_hide_locked_loot = QCheckBox("Hide Locked Room Loot")
         self.chk_hide_locked_loot.setToolTip(
@@ -723,20 +729,28 @@ class MainWindow(QMainWindow):
     def on_category_toggles(self, _checked: bool = False):
         for cid, btn in self.category_btns.items():
             self.settings.setValue(f"category/{cid}", btn.isChecked())
-        if self._active_category_ids():
-            # Categories need Loose loot visible so item icons can draw.
-            if not self.layer_sidebar.enabled_layers().get("loose_loot", False):
-                self.layer_sidebar.set_layer_checked("loose_loot", True, emit=False)
-                self.layer_sidebar.save_settings(self._layer_settings_prefix(), self.settings)
         self._update_loot_stats()
         self.refresh_map_layers()
 
+    def on_only_selected_changed(self, _state: int = 0):
+        self.settings.setValue("only_selected_loot", self.chk_item_hunt.isChecked())
+        self._update_loot_stats()
+        self.refresh_map_layers()
+
+    def _only_selected(self) -> bool:
+        return self.chk_item_hunt.isChecked()
+
     def _active_hunt_ids(self) -> set[str]:
-        """Selected + quick-category items that pass the price filter."""
+        """Item ids whose spawn locations should be drawn as item icons."""
         ids = set(self._category_item_ids())
-        if self.chk_item_hunt.isChecked():
+        if self._only_selected():
             ids |= self.selected_item_ids
-        return ids & set(self.filtered_items.keys())
+            return ids
+        if not ids:
+            return set()
+        if self._price_filter_active():
+            return ids & set(self.filtered_items.keys())
+        return ids
 
     def _price_filter_active(self) -> bool:
         return self.chk_price.isChecked()
@@ -756,16 +770,19 @@ class MainWindow(QMainWindow):
         if cats:
             labels = [CATEGORY_META[c]["label"] for c in CATEGORY_ORDER if c in cats]
             cat_note = f"\nQuick: {', '.join(labels)} ({len(self._category_item_ids())} items)"
+        stars_hidden = bool(cats) or self._only_selected()
+        mode = "only selected" if self._only_selected() else "all loot"
         self.loot_stats.setText(
-            f"Item hunt: {len(self.filtered_items)} pass filter · "
-            f"{len(self.selected_item_ids)} selected · {len(spots)} spots"
+            f"Loot: {mode} · {len(self.selected_item_ids)} selected · {len(spots)} spots"
             f"{cat_note}\n"
-            f"Loose loot stars: {len(loose_shown) if not cats else 0} / {len(self.layer_data.loose_loot)}"
+            f"Loose loot stars: {0 if stars_hidden else len(loose_shown)} / {len(self.layer_data.loose_loot)}"
         )
 
     def select_all_filtered(self):
         self.selected_item_ids = set(self.filtered_items.keys())
         self._save_selection()
+        if self.selected_item_ids:
+            self.chk_item_hunt.setChecked(True)
         self._update_loot_stats()
         self.refresh_map_layers()
 
@@ -777,16 +794,7 @@ class MainWindow(QMainWindow):
                 "No map items loaded yet.\nClick Refresh map data, then try again.",
             )
             return
-        # Prefer price-filtered set; fall back to all map items so the dialog always opens.
-        items = self.filtered_items or dict(self.map_items)
-        if not items:
-            QMessageBox.information(
-                self,
-                "Filter Items",
-                "No items on this map match your price filter.\n"
-                "Lower the min price or disable the filter, then try again.",
-            )
-            return
+        items = dict(self.map_items)
         try:
             dialog = ItemFilterDialog(items, self.selected_item_ids, self)
             dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -796,11 +804,9 @@ class MainWindow(QMainWindow):
             dialog.raise_()
             dialog.activateWindow()
             if dialog.exec():
-                shown = set(items.keys())
-                # Keep selections for items not currently listed (e.g. filtered out by price).
-                kept = self.selected_item_ids - shown
-                self.selected_item_ids = kept | dialog.get_selected()
+                self.selected_item_ids = dialog.get_selected()
                 self._save_selection()
+                self.chk_item_hunt.setChecked(bool(self.selected_item_ids))
                 self._update_loot_stats()
                 self.refresh_map_layers()
         except Exception as exc:
@@ -1076,18 +1082,17 @@ class MainWindow(QMainWindow):
             locks=enabled.get("locks", False),
             switches=enabled.get("switches", False),
             stationary_weapons=enabled.get("stationary_weapons", False),
-            # Categories force item icons even if "Show selected" is off.
-            item_hunt=self.chk_item_hunt.isChecked() or category_on,
+            item_hunt=self._only_selected() or category_on,
             show_locked_doors=self.chk_show_locked_doors.isChecked(),
         )
 
     def refresh_map_layers(self):
-        self.settings.setValue("item_hunt_enabled", self.chk_item_hunt.isChecked())
+        self.settings.setValue("only_selected_loot", self.chk_item_hunt.isChecked())
         state = dict(
             visibility=self._build_visibility(),
             selected_ids=self._active_hunt_ids(),
             price_filter_ids=self._price_filter_ids(),
-            hide_loose_stars=bool(self._active_category_ids()),
+            hide_loose_stars=bool(self._active_category_ids()) or self._only_selected(),
             quest_spots=self._active_quest_spots(),
             haze_off_floor=True,
             hide_locked_room_loot=self.chk_hide_locked_loot.isChecked(),
@@ -1122,7 +1127,7 @@ class MainWindow(QMainWindow):
             visibility=self._build_visibility(),
             selected_ids=self._active_hunt_ids(),
             price_filter_ids=self._price_filter_ids(),
-            hide_loose_stars=bool(self._active_category_ids()),
+            hide_loose_stars=bool(self._active_category_ids()) or self._only_selected(),
             quest_spots=self._active_quest_spots(),
             haze_off_floor=True,
             hide_locked_room_loot=self.chk_hide_locked_loot.isChecked(),
@@ -1805,7 +1810,10 @@ class MainWindow(QMainWindow):
         allowed = self._price_filter_ids()
         hunt = self._active_hunt_ids()
         if hunt:
-            allowed = hunt if allowed is None else (allowed & hunt)
+            if self._only_selected():
+                allowed = hunt
+            else:
+                allowed = hunt if allowed is None else (allowed & hunt)
         locked = set(self._locked_loot_ids)
         remaining = remaining_seconds(
             in_raid=self.in_raid,
