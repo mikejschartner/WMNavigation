@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QTransform, QWheelEvent
 
+from .coords import PlayerState, crs_bounds_from_map, game_to_map
 from .heading import map_facing_deg
 from .floors import FloorOption, marker_on_floor
 from .loot_filter import best_item_at_spot, filter_spots, spot_is_super_rare

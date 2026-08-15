@@ -50,6 +50,13 @@ def main() -> int:
         title = window.windowTitle()
         if __version__ not in title:
             raise RuntimeError(f"window title {title!r} missing version {__version__}")
+        mv = window.map_view
+        has_art = mv.map_item is not None or mv._tile_item is not None
+        if not has_art:
+            raise RuntimeError("map graphic missing after MainWindow load")
+        rect = mv.scene.sceneRect()
+        if rect.width() < 40 or rect.height() < 40:
+            raise RuntimeError(f"map scene empty: {rect}")
         print(f"SMOKE OK v{__version__} title={title}")
         return 0
     except Exception:

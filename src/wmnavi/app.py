@@ -211,6 +211,9 @@ class MainWindow(QMainWindow):
         try:
             self.load_map(self.current_map_slug)
         except Exception as exc:
+            import traceback
+
+            traceback.print_exc()
             self.status_label.setText(f"Map load failed: {exc}")
         try:
             self.start_watchers()
