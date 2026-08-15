@@ -143,7 +143,7 @@ def get_item_hunt_marker(
     from .icon_cache import get_item_icon
     from .wiki_icons import best_icon_url_cached
 
-    size_i = max(12, int(round(size)))
+    size_i = max(8, int(round(size)))
     cache = _cache_key("hunt_hq", f"{item_id}:{size_i}", size_i)
     if cache in _ICON_CACHE:
         return _ICON_CACHE[cache]
@@ -185,7 +185,7 @@ def get_item_hunt_marker(
 
 def get_quest_marker(size: float = 18, requires_key: bool = False) -> QPixmap:
     """Gold quest pin; optional K badge for key-required quests."""
-    size_i = max(12, int(round(size)))
+    size_i = max(8, int(round(size)))
     cache = _cache_key("quest", f"k{int(requires_key)}", size_i)
     if cache in _ICON_CACHE:
         return _ICON_CACHE[cache]

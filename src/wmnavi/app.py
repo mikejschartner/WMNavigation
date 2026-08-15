@@ -943,27 +943,30 @@ class MainWindow(QMainWindow):
                 self.current_game_mode,
                 only_ids=only_ids,
             )
-            # Show all linked active quests on map by default.
-            self.active_quest_ids = {q.id for q in self.map_quests}
-            self._save_active_quests()
+            # Linked from logs, but still off the map until the user checks them.
+            self._load_active_quests()
         else:
             self.map_quests = load_quests_for_map(self.current_map_slug, self.current_game_mode)
             self.anywhere_quests = []
             self._load_active_quests()
-            valid = {q.id for q in self.map_quests}
-            self.active_quest_ids &= valid
 
         self._rebuild_quest_menu()
         self.refresh_map_layers()
         self._refresh_quest_route_if_active()
 
     def _load_active_quests(self):
+        """Restore manual picks. Never auto-enable every quest on the map."""
         raw = self.settings.value(self._quest_settings_key(), "")
         if isinstance(raw, str) and raw.strip():
             self.active_quest_ids = {x for x in raw.split(",") if x}
         elif isinstance(raw, (list, tuple)):
             self.active_quest_ids = {str(x) for x in raw}
         else:
+            self.active_quest_ids = set()
+        valid = {q.id for q in self.map_quests}
+        self.active_quest_ids &= valid
+        # Older builds checked every quest on map load — treat that as "none".
+        if valid and self.active_quest_ids == valid:
             self.active_quest_ids = set()
 
     def _save_active_quests(self):
@@ -1347,7 +1350,13 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def on_player_update(self, state: PlayerState):
         self._last_player = state
-        self.heading.set_authoritative(state.yaw_deg, self.map_view.map_rotation)
+        self.heading.set_authoritative(
+            state.yaw_deg,
+            self.map_view.map_rotation,
+            x=state.x,
+            z=state.z,
+            transform=self.map_view.map_transform,
+        )
         self._select_floor_for_y(state.y)
         self.map_view.set_player(state)
         self.map_view.center_on_player()
@@ -1746,7 +1755,11 @@ class MainWindow(QMainWindow):
             self.compass = CompassHud(self.heading)
             if self._last_player:
                 self.heading.set_authoritative(
-                    self._last_player.yaw_deg, self.map_view.map_rotation
+                    self._last_player.yaw_deg,
+                    self.map_view.map_rotation,
+                    x=self._last_player.x,
+                    z=self._last_player.z,
+                    transform=self.map_view.map_transform,
                 )
                 self.compass.set_player_xz(self._last_player.x, self._last_player.z)
             self.compass.set_world_context(
@@ -1767,7 +1780,11 @@ class MainWindow(QMainWindow):
             return
         if self._last_player:
             self.heading.set_authoritative(
-                self._last_player.yaw_deg, self.map_view.map_rotation
+                self._last_player.yaw_deg,
+                self.map_view.map_rotation,
+                x=self._last_player.x,
+                z=self._last_player.z,
+                transform=self.map_view.map_transform,
             )
             self.compass.set_player_xz(self._last_player.x, self._last_player.z)
         visible = self.compass.toggle()
@@ -1982,8 +1999,6 @@ class MainWindow(QMainWindow):
             self.anywhere_quests = []
             self.map_quests = load_quests_for_map(slug, self.current_game_mode)
             self._load_active_quests()
-            valid = {q.id for q in self.map_quests}
-            self.active_quest_ids &= valid
             self._rebuild_quest_menu()
 
         self._load_selection()

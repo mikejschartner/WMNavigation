@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QTransform, QWheelEvent
 
-from .coords import PlayerState, crs_bounds_from_map, game_to_map
+from .heading import map_facing_deg
 from .floors import FloorOption, marker_on_floor
 from .loot_filter import best_item_at_spot, filter_spots, spot_is_super_rare
 from .locks import door_locks, lock_key_name
@@ -75,8 +75,8 @@ class PlayerMarker(QGraphicsPixmapItem):
     def set_state(self, x: float, y: float, yaw_deg: float, map_rotation: int):
         self._state = (x, y, yaw_deg, map_rotation)
         self.setPos(x, y)
-        # Drawn arrow points up (north). Qt rotates clockwise; map_rotation matches CRS.
-        self.setRotation(yaw_deg + map_rotation)
+        # Drawn arrow points up (north). Angle is already map-space (Factory-safe).
+        self.setRotation(yaw_deg)
 
 
 class MapMarkerItem(QGraphicsPixmapItem):
@@ -459,7 +459,10 @@ class MapView(QGraphicsView):
             self.player.hide()
             return
         mx, my = game_to_map(state.x, state.z, self.map_rotation, self.map_transform)
-        self.player.set_state(mx, my, state.yaw_deg, self.map_rotation)
+        facing = map_facing_deg(
+            state.x, state.z, state.yaw_deg, self.map_rotation, self.map_transform
+        )
+        self.player.set_state(mx, my, facing, 0)
         self.player.show()
         self.player_updated.emit(state)
 
@@ -543,7 +546,15 @@ class MapView(QGraphicsView):
             marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             marker.setOffset(-pix.width() / 2, -pix.height() / 2)
             marker.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-            marker.setRotation(float(getattr(ping, "yaw_deg", 0)) + self.map_rotation)
+            marker.setRotation(
+                map_facing_deg(
+                    ping.x,
+                    ping.z,
+                    float(getattr(ping, "yaw_deg", 0)),
+                    self.map_rotation,
+                    self.map_transform,
+                )
+            )
             marker.setPos(mx, my)
             marker.setZValue(1900)
             marker.setOpacity(opacity)
@@ -650,11 +661,11 @@ class MapView(QGraphicsView):
             if not data:
                 return
             vis = self._visibility
-            item_px = self._px(22)
+            item_px = self._px(14)
             container_px = self._px(14)
             extract_px = self._px(7)
             usable_px = self._px(12)
-            loose_px = self._px(10)
+            loose_px = self._px(6)
 
             # Loose loot stars when the layer is on and we are not in "only selected" mode.
             if vis.loose_loot and not self._hide_loose_stars:
@@ -769,7 +780,7 @@ class MapView(QGraphicsView):
 
             # Active quest objective markers
             if self._quest_spots:
-                quest_px = self._px(20)
+                quest_px = self._px(12)
                 pix_plain = get_quest_marker(quest_px, requires_key=False)
                 pix_key = get_quest_marker(quest_px, requires_key=True)
                 for spot in self._quest_spots:

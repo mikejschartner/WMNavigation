@@ -25,6 +25,24 @@ def map_heading(yaw_deg: float, map_rotation: int) -> float:
     return wrap_deg(float(yaw_deg) + float(map_rotation or 0))
 
 
+def map_facing_deg(
+    x: float,
+    z: float,
+    yaw_deg: float,
+    map_rotation: int,
+    transform: list[float] | None,
+) -> float:
+    """Qt rotation for the player arrow: project 1m forward, then measure on the map.
+
+    yaw + map_rotation is wrong on 90°/270° maps (Factory, Labs) — the marker
+    ends up backwards. This follows the same CRS as position.
+    """
+    rad = math.radians(float(yaw_deg))
+    fx = float(x) + math.sin(rad)
+    fz = float(z) + math.cos(rad)
+    return map_bearing(x, z, fx, fz, map_rotation, transform)
+
+
 def map_bearing(
     from_x: float,
     from_z: float,
@@ -59,8 +77,19 @@ class HeadingTracker:
         self._last_sample_at = 0.0
         self._last_tick = time.perf_counter()
 
-    def set_authoritative(self, yaw_deg: float, map_rotation: int = 0):
-        heading = map_heading(yaw_deg, map_rotation)
+    def set_authoritative(
+        self,
+        yaw_deg: float,
+        map_rotation: int = 0,
+        *,
+        x: float | None = None,
+        z: float | None = None,
+        transform: list[float] | None = None,
+    ):
+        if x is not None and z is not None:
+            heading = map_facing_deg(x, z, yaw_deg, map_rotation, transform)
+        else:
+            heading = map_heading(yaw_deg, map_rotation)
         self.authoritative = heading
         self._last_sample_at = time.perf_counter()
         if not self.has_heading:
