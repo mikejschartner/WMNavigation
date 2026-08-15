@@ -36,6 +36,8 @@ from watchdog.observers import Observer
 
 from . import __version__
 from .assets import cache_remote_file
+from .audio_hud import AudioIndicatorHud
+from .audio_service import AudioShotService
 from .compass import CompassHud
 from .coords import PlayerState
 from .extract_panel import ExtractAvailabilityPanel, unique_extracts
@@ -199,7 +201,15 @@ class MainWindow(QMainWindow):
         self.motion = MotionTracker(self)
         self.motion.sample.connect(self._on_motion_sample)
         self._ai_prediction_on = False
+        self._audio_indicator_on = False
         self._tracking_debug = False
+        self.audio = AudioShotService(self)
+        self.audio.set_heading_provider(self._audio_game_yaw)
+        self.audio.shot.connect(self._on_audio_shot)
+        self.audio.failed.connect(self._on_audio_failed)
+        self.audio.started.connect(self._on_audio_started)
+        self.audio_hud = AudioIndicatorHud(self.heading, self.audio.manager)
+        self.audio_hud.debug_fn = lambda: self.audio.debug
         self._last_loc_ms = 0.0
         self.nav_graph = NavGraph()
         self._locked_loot_ids: set[str] = set()
@@ -577,6 +587,14 @@ class MainWindow(QMainWindow):
         self.btn_ai_prediction.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.btn_ai_prediction.customContextMenuRequested.connect(self._ai_prediction_menu)
         top_row.addWidget(self.btn_ai_prediction)
+        self.btn_audio_indicator = QPushButton("Audio Indicator")
+        self.btn_audio_indicator.setCheckable(True)
+        self.btn_audio_indicator.setToolTip(
+            "Optional: listen to game output for gunshots and show a brief top-of-screen direction.\n"
+            "Does not mute or reroute Tarkov audio. Independent of Compass and AI Prediction."
+        )
+        self.btn_audio_indicator.toggled.connect(self.on_audio_indicator_toggled)
+        top_row.addWidget(self.btn_audio_indicator)
         map_layout.addWidget(map_top)
 
         self.tracking_debug_label = QLabel("")
@@ -1683,6 +1701,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            self.audio.stop()
+            self.audio_hud.shutdown()
+        except Exception:
+            pass
+        try:
             self.hotkeys.stop()
         except Exception:
             pass
@@ -1851,6 +1874,7 @@ class MainWindow(QMainWindow):
             )
             self.compass.set_player_xz(self._last_player.x, self._last_player.z)
         visible = self.compass.toggle()
+        self.audio_hud.set_compass_visible(visible)
         self._sync_motion_tracker()
         if visible:
             self.status_label.setText("Compass on (F9)")
@@ -1880,6 +1904,51 @@ class MainWindow(QMainWindow):
             self._apply_live_marker()
         self._update_tracking_debug()
 
+    def _audio_game_yaw(self):
+        if self._compass_on() and self.heading.has_heading:
+            return float(self.heading.game_yaw)
+        return None
+
+    def on_audio_indicator_toggled(self, on: bool):
+        self._audio_indicator_on = bool(on)
+        self.audio_hud.debug = self._tracking_debug
+        self.audio_hud.set_compass_visible(self._compass_on())
+        if on:
+            self.audio.start()
+            if self.audio.active:
+                self.status_label.setText("Audio Indicator on · listening to game output")
+                if self._tracking_debug:
+                    self.audio_hud.note_shot()
+            else:
+                self.btn_audio_indicator.blockSignals(True)
+                self.btn_audio_indicator.setChecked(False)
+                self.btn_audio_indicator.blockSignals(False)
+                self._audio_indicator_on = False
+                self.audio_hud.shutdown()
+        else:
+            self.audio.stop()
+            self.audio_hud.shutdown()
+            self.status_label.setText("Audio Indicator off")
+        self._update_tracking_debug()
+
+    @Slot(object)
+    def _on_audio_shot(self, _event):
+        if not self._audio_indicator_on:
+            return
+        self.audio_hud.debug_snapshot = self.audio.debug
+        self.audio_hud.set_compass_visible(self._compass_on())
+        self.audio_hud.note_shot()
+        self._update_tracking_debug()
+
+    def _on_audio_failed(self, err: str):
+        self.status_label.setText(f"Audio Indicator: {err}")
+        self._update_tracking_debug()
+
+    def _on_audio_started(self, info):
+        name = getattr(info, "device_name", "") or "WASAPI loopback"
+        self.status_label.setText(f"Audio Indicator on · {name}")
+        self._update_tracking_debug()
+
     def _ai_prediction_menu(self, pos):
         menu = QMenu(self)
         act = menu.addAction("Reset prediction calibration")
@@ -1892,6 +1961,9 @@ class MainWindow(QMainWindow):
     def on_tracking_debug_toggled(self, on: bool):
         self._tracking_debug = bool(on)
         self.tracking_debug_label.setVisible(self._tracking_debug)
+        self.audio_hud.debug = self._tracking_debug
+        if self._tracking_debug and self._audio_indicator_on:
+            self.audio_hud.note_shot()
         self._apply_live_marker()
         self._update_tracking_debug()
 
@@ -1957,7 +2029,27 @@ class MainWindow(QMainWindow):
             f"{conf_line} · {pred_line} · spd {st.speed:.1f}m/s · "
             f"conf {st.confidence:.2f} · err {st.last_error_m:.1f}m · "
             f"{cal.state_name()} n={cal.samples} · t+{self.predictor.time_since_confirm():.1f}s · "
-            f"loc {st.loc_ms:.1f}ms · {self.motion.fps:.0f} Hz · {flow}"
+            f"loc {st.loc_ms:.1f}ms · {self.motion.fps:.0f} Hz · {flow} · {self._audio_debug_line()}"
+        )
+
+    def _audio_debug_line(self) -> str:
+        cap = self.audio.capture
+        dbg = self.audio.debug
+        yaw = self._audio_game_yaw()
+        yaw_s = f"{yaw:.0f}°" if yaw is not None else "—"
+        events = self.audio.manager.events
+        ev_s = ",".join(
+            f"{e.rel_deg:+.0f}°x{e.count}" + (f"@{e.world_bearing:.0f}" if e.world_bearing is not None else "")
+            for e in events
+        ) or "none"
+        if not cap.ok and not self._audio_indicator_on:
+            return "AUD off"
+        status = "ok" if cap.ok and self.audio.active else (cap.error or "idle")
+        return (
+            f"AUD {status} {cap.device_name[:28]} "
+            f"L {dbg.rms_l:.3f} R {dbg.rms_r:.3f} "
+            f"p {dbg.gunshot_prob:.2f} {dbg.rel_deg:+.0f}° dconf {dbg.dir_conf:.2f} "
+            f"yaw {yaw_s} lat {self.audio.last_latency_ms:.0f}ms ev [{ev_s}]"
         )
 
     def _available_extracts(self) -> list:

@@ -61,12 +61,46 @@ def test_blend():
     assert abs(_blend(1.0, 2.0, 0.5) - 1.5) < 1e-9
 
 
+def test_audio_ild_right_positive():
+    import numpy as np
+    from wmnavi.audio_detect import ild_to_deg, ShotEvent, ShotEventManager, detect_gunshot
+
+    deg, conf, ild = ild_to_deg(0.05, 0.2)
+    assert deg > 20
+    assert conf > 0.3
+    deg_l, _, _ = ild_to_deg(0.2, 0.05)
+    assert deg_l < -20
+
+    sr = 48000
+    n = int(0.03 * sr)
+    t = np.arange(n) / sr
+    burst = np.exp(-t * 180.0) * np.sin(2 * np.pi * 3200 * t)
+    left = burst * 0.15
+    right = burst * 0.9
+    prob, dbg = detect_gunshot(left, right, sr, noise_rms=0.01)
+    assert prob > 0.4
+    assert dbg.rms_r > dbg.rms_l
+
+    mgr = ShotEventManager()
+    a = ShotEvent(t0=10.0, rel_deg=35.0, gunshot_prob=0.9, dir_conf=0.7)
+    b = ShotEvent(t0=10.2, rel_deg=38.0, gunshot_prob=0.8, dir_conf=0.6)
+    c = ShotEvent(t0=10.3, rel_deg=-60.0, gunshot_prob=0.85, dir_conf=0.7)
+    mgr.ingest(a)
+    merged = mgr.ingest(b)
+    assert merged.count == 2
+    mgr.ingest(c)
+    assert len(mgr.events) == 2
+    world = ShotEvent(t0=1.0, rel_deg=40.0, gunshot_prob=0.9, dir_conf=0.8, world_bearing=160.0)
+    assert abs(mgr.display_rel(world, 150.0) - 10.0) < 0.01
+
+
 def main() -> int:
     test_wrap_and_shortest()
     test_heading_visual_then_correct()
     test_large_heading_error_snaps()
     test_predictor_confirm_and_motion()
     test_blend()
+    test_audio_ild_right_positive()
     print("TRACKING MATH OK")
     return 0
 
