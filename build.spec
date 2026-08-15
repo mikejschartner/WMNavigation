@@ -12,7 +12,7 @@ a = Analysis(
         (str(root / "data" / "maps.json"), "data"),
         (str(root / "data" / "questie"), "data/questie"),
     ],
-    hiddenimports=["PySide6.QtSvg", "paho", "paho.mqtt", "paho.mqtt.client"],
+    hiddenimports=["PySide6.QtSvg", "paho", "paho.mqtt", "paho.mqtt.client", "cv2", "numpy"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

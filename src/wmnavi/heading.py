@@ -61,21 +61,26 @@ def map_bearing(
 class HeadingTracker:
     """Authoritative heading from screenshots, displayed heading for the HUD.
 
-    Screenshot samples arrive every few seconds. The compass ticks this at
-    60–120 FPS so rendering stays smooth; we do not invent extra orientation
-    sources. New samples take the shortest angular path (358° → 2° is +4°).
+    Screenshot samples are ground truth. Between pings, visual yaw (optical
+    flow) updates `predicted` so the compass can turn in real time. `tick()`
+    at ~60 FPS only lerps the displayed needle — it does not invent heading.
     """
 
-    # Catch ~90° in ~100ms. Fast enough to avoid lag, slow enough to hide jumps.
-    LERP_RATE = 18.0
-    SNAP_DEG = 0.2
+    LERP_RATE = 22.0
+    SNAP_DEG = 0.15
+    LARGE_ERR_DEG = 22.0
 
     def __init__(self):
         self.authoritative = 0.0
+        self.predicted = 0.0
         self.display = 0.0
+        self.game_yaw = 0.0
         self.has_heading = False
         self._last_sample_at = 0.0
         self._last_tick = time.perf_counter()
+        self._map_rotation = 0
+        self._transform: list[float] | None = None
+        self._xz: tuple[float, float] | None = None
 
     def set_authoritative(
         self,
@@ -86,15 +91,45 @@ class HeadingTracker:
         z: float | None = None,
         transform: list[float] | None = None,
     ):
+        self.game_yaw = wrap_deg(float(yaw_deg))
+        self._map_rotation = int(map_rotation or 0)
+        self._transform = transform
         if x is not None and z is not None:
+            self._xz = (float(x), float(z))
             heading = map_facing_deg(x, z, yaw_deg, map_rotation, transform)
         else:
             heading = map_heading(yaw_deg, map_rotation)
         self.authoritative = heading
         self._last_sample_at = time.perf_counter()
         if not self.has_heading:
+            self.predicted = heading
             self.display = heading
             self.has_heading = True
+            return
+        err = shortest_delta(self.predicted, heading)
+        if abs(err) >= self.LARGE_ERR_DEG:
+            self.predicted = heading
+        else:
+            self.predicted = wrap_deg(self.predicted + err * 0.72)
+
+    def apply_visual_yaw(self, game_yaw_delta_deg: float, confidence: float):
+        """Integrate camera turn between localization pings (game-space degrees)."""
+        if not self.has_heading or confidence < 0.12:
+            return
+        delta = float(game_yaw_delta_deg)
+        if abs(delta) < 0.02:
+            return
+        self.game_yaw = wrap_deg(self.game_yaw + delta)
+        if self._xz is not None:
+            self.predicted = map_facing_deg(
+                self._xz[0],
+                self._xz[1],
+                self.game_yaw,
+                self._map_rotation,
+                self._transform,
+            )
+        else:
+            self.predicted = wrap_deg(self.predicted + delta)
 
     def tick(self) -> float:
         now = time.perf_counter()
@@ -102,9 +137,10 @@ class HeadingTracker:
         self._last_tick = now
         if not self.has_heading:
             return self.display
-        delta = shortest_delta(self.display, self.authoritative)
+        target = self.predicted
+        delta = shortest_delta(self.display, target)
         if abs(delta) <= self.SNAP_DEG:
-            self.display = self.authoritative
+            self.display = wrap_deg(target)
             return self.display
         self.display = wrap_deg(self.display + delta * min(1.0, dt * self.LERP_RATE))
         return self.display

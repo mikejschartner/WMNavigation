@@ -41,6 +41,15 @@ def main() -> int:
 
     try:
         _import_all()
+        from pathlib import Path
+        import runpy
+
+        math_test = Path(__file__).resolve().parent / "test_tracking_math.py"
+        try:
+            runpy.run_path(str(math_test), run_name="__main__")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                raise RuntimeError(f"tracking math tests failed: {exc.code}") from exc
         app = QApplication(sys.argv)
         app.setApplicationName("WMNavigation-smoke")
         window = MainWindow()

@@ -59,18 +59,17 @@ class LayerVisibility:
 
 
 class PlayerMarker(QGraphicsPixmapItem):
-    """Precision marker — green dot = position, green arrow = look direction."""
+    """Precision marker — colored dot = position, matching arrow = look direction."""
 
-    def __init__(self, size_px: float = 28):
-        pix = load_player_marker_pixmap(size_px)
+    def __init__(self, size_px: float = 28, color: str = "#22ff55"):
+        pix = load_player_marker_pixmap(size_px, color=color)
         super().__init__(pix)
-        # Center of pixmap (black dot) sits on true map coordinates.
         self.setOffset(-pix.width() / 2, -pix.height() / 2)
         self.setZValue(2000)
         self.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-        # Keep a steady on-screen size while the map zooms.
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
         self._size_px = size_px
+        self._color = color
         self._state: tuple[float, float, float, int] | None = None
 
     def set_state(self, x: float, y: float, yaw_deg: float, map_rotation: int):
@@ -192,6 +191,11 @@ class MapView(QGraphicsView):
         self.player = PlayerMarker(self._px(28))
         self.scene.addItem(self.player)
         self.player.hide()
+        self.confirmed_ghost = PlayerMarker(self._px(22), color="#e5e7eb")
+        self.confirmed_ghost.setZValue(1990)
+        self.confirmed_ghost.setOpacity(0.55)
+        self.scene.addItem(self.confirmed_ghost)
+        self.confirmed_ghost.hide()
 
     def set_marker_scale(self, scale: float):
         """Slider scale for on-screen marker pixels (independent of map zoom)."""
@@ -212,10 +216,19 @@ class MapView(QGraphicsView):
         old = self.player
         was_visible = old.isVisible()
         old_state = getattr(old, "_state", None)
-        self.player = PlayerMarker(self._px(28))
+        ghost = self.confirmed_ghost
+        ghost_vis = ghost.isVisible()
+        ghost_state = getattr(ghost, "_state", None)
+        self.player = PlayerMarker(self._px(28), color=getattr(old, "_color", "#22ff55"))
         self.scene.addItem(self.player)
+        self.confirmed_ghost = PlayerMarker(self._px(22), color="#e5e7eb")
+        self.confirmed_ghost.setZValue(1990)
+        self.confirmed_ghost.setOpacity(0.55)
+        self.scene.addItem(self.confirmed_ghost)
         if old.scene():
             self.scene.removeItem(old)
+        if ghost.scene():
+            self.scene.removeItem(ghost)
         if old_state:
             self.player.set_state(*old_state)
             if was_visible:
@@ -224,6 +237,14 @@ class MapView(QGraphicsView):
                 self.player.hide()
         else:
             self.player.hide()
+        if ghost_state:
+            self.confirmed_ghost.set_state(*ghost_state)
+            if ghost_vis:
+                self.confirmed_ghost.show()
+            else:
+                self.confirmed_ghost.hide()
+        else:
+            self.confirmed_ghost.hide()
 
     def set_floor(self, floor: FloorOption):
         self._floor = floor
@@ -466,6 +487,17 @@ class MapView(QGraphicsView):
         self.player.set_state(mx, my, facing, 0)
         self.player.show()
         self.player_updated.emit(state)
+
+    def set_confirmed_ghost(self, state: PlayerState | None, visible: bool = False):
+        if not state or not visible:
+            self.confirmed_ghost.hide()
+            return
+        mx, my = game_to_map(state.x, state.z, self.map_rotation, self.map_transform)
+        facing = map_facing_deg(
+            state.x, state.z, state.yaw_deg, self.map_rotation, self.map_transform
+        )
+        self.confirmed_ghost.set_state(mx, my, facing, 0)
+        self.confirmed_ghost.show()
 
     def set_layer_data(self, data: MapLayerData):
         self._layer_data = data

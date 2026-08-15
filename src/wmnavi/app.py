@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -63,7 +64,9 @@ from .map_data_loader import load_map_layers
 from .map_view import LayerVisibility, MapView
 from .minimap import MiniMapWindow
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
+from .motion_tracker import MotionTracker
 from .paths import app_root, cache_dir
+from .predictor import MovementPredictor
 from .quest_loader import QuestInfo, load_quests_for_map, load_quests_split
 from .quest_log_sync import (
     QuestEvent,
@@ -192,6 +195,12 @@ class MainWindow(QMainWindow):
         self._screenshot_loop_on = True
         self.heading = HeadingTracker()
         self.compass = None
+        self.predictor = MovementPredictor()
+        self.motion = MotionTracker(self)
+        self.motion.sample.connect(self._on_motion_sample)
+        self._ai_prediction_on = False
+        self._tracking_debug = False
+        self._last_loc_ms = 0.0
         self.nav_graph = NavGraph()
         self._locked_loot_ids: set[str] = set()
         self._active_route: RouteResult | None = None
@@ -439,6 +448,11 @@ class MainWindow(QMainWindow):
         bottom_layout.addWidget(self.minimap_zoom_label)
         self._update_minimap_zoom_label()
 
+        self.chk_tracking_debug = QCheckBox("Tracking debug")
+        self.chk_tracking_debug.setToolTip("Show confirmed vs predicted tracking numbers (not for normal raids).")
+        self.chk_tracking_debug.toggled.connect(self.on_tracking_debug_toggled)
+        bottom_layout.addWidget(self.chk_tracking_debug)
+
         bottom_layout.addWidget(QLabel("Mini map marker size"))
         self.minimap_marker_slider = QSlider(Qt.Orientation.Horizontal)
         self.minimap_marker_slider.setRange(40, 250)
@@ -553,7 +567,23 @@ class MainWindow(QMainWindow):
         self.btn_loot_route.clicked.connect(lambda: self.start_route("loot"))
         top_row.addWidget(self.btn_loot_route)
         top_row.addStretch(1)
+        self.btn_ai_prediction = QPushButton("AI Prediction")
+        self.btn_ai_prediction.setCheckable(True)
+        self.btn_ai_prediction.setToolTip(
+            "Optional: estimate movement between V pings using lightweight visual tracking.\n"
+            "Right-click to reset learned calibration. Screenshot localization stays ground truth."
+        )
+        self.btn_ai_prediction.toggled.connect(self.on_ai_prediction_toggled)
+        self.btn_ai_prediction.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.btn_ai_prediction.customContextMenuRequested.connect(self._ai_prediction_menu)
+        top_row.addWidget(self.btn_ai_prediction)
         map_layout.addWidget(map_top)
+
+        self.tracking_debug_label = QLabel("")
+        self.tracking_debug_label.setObjectName("status")
+        self.tracking_debug_label.setWordWrap(True)
+        self.tracking_debug_label.hide()
+        map_layout.addWidget(self.tracking_debug_label)
 
         self.map_view = MapView()
         self.map_view.player_updated.connect(self._update_pos_label)
@@ -1360,8 +1390,16 @@ class MainWindow(QMainWindow):
             z=state.z,
             transform=self.map_view.map_transform,
         )
+        self.predictor.confirm(
+            state,
+            map_slug=self.current_map_slug,
+            loc_ms=self._last_loc_ms,
+            bounds=self.map_view.map_bounds,
+            rotation=self.map_view.map_rotation,
+            transform=self.map_view.map_transform,
+        )
         self._select_floor_for_y(state.y)
-        self.map_view.set_player(state)
+        self._apply_live_marker()
         self.map_view.center_on_player()
         if self.compass is not None:
             self.compass.set_player_xz(state.x, state.z)
@@ -1371,7 +1409,8 @@ class MainWindow(QMainWindow):
                 self.current_map_slug,
             )
         if self._minimap_ok() and self.minimap.isVisible():
-            self.minimap.map_view.set_player(state)
+            live = self._live_player_state() or state
+            self.minimap.map_view.set_player(live)
             self.minimap.map_view.set_floor(self.map_view._floor)
             self._refocus_minimap_view(self.minimap.map_view)
         floor_label = self.floor_combo.currentText()
@@ -1380,17 +1419,19 @@ class MainWindow(QMainWindow):
             f"Facing {state.yaw_deg:.0f}° · {floor_label}"
         )
         if self.friend_sync.room:
+            live = self._live_player_state() or state
             self.friend_sync.publish_position(
                 map_slug=self.current_map_slug,
-                x=state.x,
-                y=state.y,
-                z=state.z,
-                yaw_deg=state.yaw_deg,
+                x=live.x,
+                y=live.y,
+                z=live.z,
+                yaw_deg=live.yaw_deg,
                 name=self.friend_name_edit.text(),
                 color=self._friend_color,
             )
         if self._route_kind:
             self._route_refresh_timer.start(1800)
+        self._update_tracking_debug()
 
     def _apply_friend_color_btn(self):
         color = self._friend_color if str(self._friend_color).startswith("#") else f"#{self._friend_color}"
@@ -1484,33 +1525,48 @@ class MainWindow(QMainWindow):
     def handle_screenshot(self, path: Path):
         if not self._screenshot_loop_on:
             return
+        # Filename already contains coordinates — do not wait for the PNG to finish writing.
+        t0 = time.perf_counter()
+        state = parse_screenshot(path)
+        if state:
+            key = str(path)
+            try:
+                if path.exists():
+                    key = str(path.resolve())
+            except OSError:
+                pass
+            if key in self._seen_screenshots:
+                return
+            self._seen_screenshots.add(key)
+            self._seen_screenshots.add(str(path))
+            self._last_loc_ms = (time.perf_counter() - t0) * 1000.0
+            self.bridge.screenshot_parsed.emit(state)
+            return
         key = str(path.resolve()) if path.exists() else str(path)
         if key in self._seen_screenshots:
             return
-        # Retry — OneDrive / game may still be writing the file.
-        for delay in (200, 500, 1000, 1800):
+        for delay in (50, 150, 350, 800):
             QTimer.singleShot(delay, lambda p=path, k=key: self._parse_screenshot_file(p, k))
 
     def _parse_screenshot_file(self, path: Path, key: str | None = None):
         if key and key in self._seen_screenshots:
             return
-        if not path.exists():
-            return
-        try:
-            if path.stat().st_size < 1024:
-                return
-        except OSError:
-            return
+        t0 = time.perf_counter()
         state = parse_screenshot(path)
         if not state:
-            # Ignore non-coordinate screenshots quietly after first attempts.
             return
-        resolved = str(path.resolve())
+        resolved = str(path)
+        try:
+            if path.exists():
+                resolved = str(path.resolve())
+        except OSError:
+            pass
         if resolved in self._seen_screenshots:
             return
         self._seen_screenshots.add(resolved)
         if key:
             self._seen_screenshots.add(key)
+        self._last_loc_ms = (time.perf_counter() - t0) * 1000.0
         self.bridge.screenshot_parsed.emit(state)
 
     def _poll_screenshots(self):
@@ -1613,6 +1669,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(800, lambda: self.import_quests_from_logs(silent=True))
 
     def closeEvent(self, event):
+        try:
+            self.motion.stop()
+        except Exception:
+            pass
         self._screenshot_poll.stop()
         self._live_timer.stop()
         self._friend_prune_timer.stop()
@@ -1791,10 +1851,114 @@ class MainWindow(QMainWindow):
             )
             self.compass.set_player_xz(self._last_player.x, self._last_player.z)
         visible = self.compass.toggle()
+        self._sync_motion_tracker()
         if visible:
             self.status_label.setText("Compass on (F9)")
         else:
             self.status_label.setText("Compass off (F9)")
+
+    def _compass_on(self) -> bool:
+        return self.compass is not None and self.compass.isVisible()
+
+    def _sync_motion_tracker(self):
+        need = self._compass_on() or self._ai_prediction_on
+        if need:
+            self.motion.start()
+        else:
+            self.motion.stop()
+
+    def on_ai_prediction_toggled(self, on: bool):
+        self._ai_prediction_on = bool(on)
+        self._sync_motion_tracker()
+        if not on:
+            self.map_view.set_confirmed_ghost(None)
+            if self._last_player:
+                self.map_view.set_player(self._last_player)
+            self.status_label.setText("AI Prediction off")
+        else:
+            self.status_label.setText("AI Prediction on · calibrating from V pings")
+            self._apply_live_marker()
+        self._update_tracking_debug()
+
+    def _ai_prediction_menu(self, pos):
+        menu = QMenu(self)
+        act = menu.addAction("Reset prediction calibration")
+        chosen = menu.exec(self.btn_ai_prediction.mapToGlobal(pos))
+        if chosen == act:
+            self.predictor.reset_calibration()
+            self.status_label.setText("Prediction calibration reset")
+            self._update_tracking_debug()
+
+    def on_tracking_debug_toggled(self, on: bool):
+        self._tracking_debug = bool(on)
+        self.tracking_debug_label.setVisible(self._tracking_debug)
+        self._apply_live_marker()
+        self._update_tracking_debug()
+
+    def _live_player_state(self) -> PlayerState | None:
+        if self._ai_prediction_on:
+            return self.predictor.predicted_player() or self._last_player
+        return self._last_player
+
+    def _apply_live_marker(self):
+        live = self._live_player_state()
+        if live:
+            self.map_view.set_player(live)
+        confirmed = self.predictor.confirmed_player() if self.predictor.state.has_fix else self._last_player
+        show_ghost = self._tracking_debug and self._ai_prediction_on
+        self.map_view.set_confirmed_ghost(confirmed, visible=show_ghost)
+        if self._minimap_ok() and self.minimap.isVisible() and live:
+            self.minimap.map_view.set_player(live)
+            self._refocus_minimap_view(self.minimap.map_view)
+
+    @Slot(object)
+    def _on_motion_sample(self, sample):
+        if not (self._compass_on() or self._ai_prediction_on):
+            return
+        yaw_delta = -float(getattr(sample, "yaw_flow_px", 0.0)) * self.predictor.calib.yaw_deg_per_px
+        self.heading.apply_visual_yaw(yaw_delta, float(getattr(sample, "feature_conf", 0.0)))
+        self.predictor.apply_motion(
+            sample,
+            prediction_on=self._ai_prediction_on,
+            bounds=self.map_view.map_bounds,
+            rotation=self.map_view.map_rotation,
+            transform=self.map_view.map_transform,
+        )
+        if self.predictor.state.has_fix:
+            self.predictor.state.predicted_yaw = self.heading.game_yaw
+        if self._ai_prediction_on:
+            self._apply_live_marker()
+        self._update_tracking_debug()
+
+    def _update_tracking_debug(self):
+        if not self._tracking_debug:
+            return
+        st = self.predictor.state
+        cal = self.predictor.calib
+        motion = self.motion.last_sample
+        conf_line = (
+            f"CONF {st.confirmed_x:.1f},{st.confirmed_z:.1f}  yaw {st.confirmed_yaw:.0f}°"
+            if st.has_fix
+            else "CONF —"
+        )
+        pred_line = (
+            f"PRED {st.predicted_x:.1f},{st.predicted_z:.1f}  yaw {st.predicted_yaw:.0f}°"
+            if st.has_fix
+            else "PRED —"
+        )
+        flow = "no frame"
+        if motion is not None:
+            flow = (
+                f"flow yaw {motion.yaw_flow_px:.2f} fwd {motion.fwd_flow_px:.2f} "
+                f"strafe {motion.strafe_flow_px:.2f} vis {motion.feature_conf:.2f} "
+                f"{motion.process_ms:.0f}ms cap={'ok' if motion.capture_ok else 'fail'}"
+            )
+        self.tracking_debug_label.setText(
+            f"{conf_line} · {pred_line} · spd {st.speed:.1f}m/s · "
+            f"conf {st.confidence:.2f} · err {st.last_error_m:.1f}m · "
+            f"{cal.state_name()} n={cal.samples} · t+{self.predictor.time_since_confirm():.1f}s · "
+            f"loc {st.loc_ms:.1f}ms · {self.motion.fps:.0f} Hz · {flow}"
+        )
 
     def _available_extracts(self) -> list:
         return self.extract_panel.selected_points()
