@@ -10,10 +10,12 @@ import numpy as np
 
 from .heading import shortest_delta, wrap_deg
 
-SHOT_LIFETIME_S = 1.65
+SHOT_LIFETIME_S = 2.1
 CLUSTER_DT_S = 0.95
 CLUSTER_DEG = 28.0
-MAX_ACTIVE = 4
+MAX_ACTIVE = 6
+# Level-invariant gate: distant cracks score by shape, not loudness.
+GUNSHOT_MIN_PROB = 0.36
 
 
 @dataclass
@@ -94,7 +96,7 @@ def itd_to_deg(left: np.ndarray, right: np.ndarray, sr: int) -> tuple[float, flo
 
 
 def detect_gunshot(left: np.ndarray, right: np.ndarray, sr: int, noise_rms: float) -> tuple[float, DetectDebug]:
-    """Return gunshot probability 0..1 and debug features."""
+    """Return gunshot probability 0..1. Distant shots score by crack shape, not loudness."""
     t0 = time.perf_counter()
     dbg = DetectDebug()
     if left.size < 32 or right.size < 32:
@@ -109,27 +111,50 @@ def detect_gunshot(left: np.ndarray, right: np.ndarray, sr: int, noise_rms: floa
     spec = np.abs(np.fft.rfft(mix * np.hanning(len(mix)))) ** 2
     freqs = np.fft.rfftfreq(len(mix), 1.0 / sr)
     total = float(np.sum(spec) + 1e-12)
-    high = _band_energy(spec, freqs, 2200.0, 9000.0)
+    high = _band_energy(spec, freqs, 1800.0, 10000.0)
     low = _band_energy(spec, freqs, 80.0, 400.0)
+    body = _band_energy(spec, freqs, 80.0, 700.0)
     voice = _band_energy(spec, freqs, 300.0, 1400.0)
     high_ratio = high / total
-    onset = rms / (noise_rms + 1e-4)
-    # Gunshots: sharp crest, strong high-mid crack, not rumble-dominated, not speech-like.
+    body_ratio = body / total
+    onset = rms / (max(float(noise_rms), 1e-6) + 1e-6)
+    # High-pass crack: distant shots stay impulsive after the boom is gone.
+    hp = np.diff(mix, prepend=mix[:1])
+    hp_peak = float(np.max(np.abs(hp)))
+    hp_rms = float(np.sqrt(np.mean(hp * hp) + 1e-12))
+    hp_crest = hp_peak / (hp_rms + 1e-9)
+    hp_onset = hp_rms / (max(float(noise_rms), 1e-6) * 2.2 + 1e-6)
+
     score = 0.0
-    if peak > 0.045:
-        score += 0.18
-    if crest > 5.5:
-        score += min(0.28, (crest - 5.5) * 0.04)
-    if high_ratio > 0.22:
-        score += min(0.28, (high_ratio - 0.18) * 0.9)
-    if onset > 3.2:
-        score += min(0.22, (onset - 3.0) * 0.06)
-    if low / total > 0.55:
-        score -= 0.25
-    if voice / total > 0.42 and high_ratio < 0.28:
-        score -= 0.2
-    if crest < 3.5:
-        score -= 0.2
+    # Impulse shape (works at any distance).
+    if crest > 4.0:
+        score += min(0.34, (crest - 4.0) * 0.055)
+    if hp_crest > 5.0:
+        score += min(0.22, (hp_crest - 5.0) * 0.035)
+    if high_ratio > 0.10:
+        score += min(0.34, (high_ratio - 0.08) * 1.15)
+    # Rise vs ambient — distant shots are quiet but still a pop.
+    if onset > 1.35:
+        score += min(0.30, (onset - 1.25) * 0.14)
+    if hp_onset > 1.5:
+        score += min(0.16, (hp_onset - 1.4) * 0.08)
+    # Quiet distant crack: do not require a loud peak.
+    if peak < 0.05 and crest >= 5.0 and high_ratio >= 0.16:
+        score += 0.16
+    if peak > 0.03:
+        score += min(0.10, peak * 1.2)
+
+    # Nearby footsteps / body / doors: thump-heavy, little crack.
+    if body_ratio > 0.50 and high_ratio < 0.22:
+        score -= 0.36
+    if low / total > 0.48 and high_ratio < 0.20:
+        score -= 0.22
+    if voice / total > 0.45 and high_ratio < 0.22:
+        score -= 0.22
+    if crest < 3.4:
+        score -= 0.30
+    if peak < 0.0035 and onset < 1.25:
+        score = 0.0
     prob = max(0.0, min(1.0, score))
     dbg.rms_l = rms_l
     dbg.rms_r = rms_r

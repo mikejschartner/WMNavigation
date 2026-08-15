@@ -57,13 +57,33 @@ def test_predictor_confirm_and_motion():
     assert p.calib.samples >= 1
 
 
+def test_predictor_coasts_when_flow_drops():
+    p = MovementPredictor()
+    p.reset_calibration()
+    p.confirm(PlayerState(0, 1, 0, 0), map_slug="customs")
+    moving = MotionSample(0.05, 0.0, 2.0, 0.0, 0.8, True, 4.0)
+    p.apply_motion(moving, prediction_on=True)
+    z_after = p.state.predicted_z
+    assert z_after != 0.0
+    weak = MotionSample(0.05, 0.0, 0.0, 0.0, 0.05, True, 4.0)
+    p.apply_motion(weak, prediction_on=True)
+    # Should still have moved (coast), not snapped back to confirm.
+    assert abs(p.state.predicted_z) >= abs(z_after) * 0.5
+
+
 def test_blend():
     assert abs(_blend(1.0, 2.0, 0.5) - 1.5) < 1e-9
 
 
 def test_audio_ild_right_positive():
     import numpy as np
-    from wmnavi.audio_detect import ild_to_deg, ShotEvent, ShotEventManager, detect_gunshot
+    from wmnavi.audio_detect import (
+        GUNSHOT_MIN_PROB,
+        ShotEvent,
+        ShotEventManager,
+        detect_gunshot,
+        ild_to_deg,
+    )
 
     deg, conf, ild = ild_to_deg(0.05, 0.2)
     assert deg > 20
@@ -78,8 +98,19 @@ def test_audio_ild_right_positive():
     left = burst * 0.15
     right = burst * 0.9
     prob, dbg = detect_gunshot(left, right, sr, noise_rms=0.01)
-    assert prob > 0.4
+    assert prob > GUNSHOT_MIN_PROB
     assert dbg.rms_r > dbg.rms_l
+
+    # Distant: same crack, ~10x quieter — must still fire.
+    quiet_l = burst * 0.012
+    quiet_r = burst * 0.018
+    qprob, _ = detect_gunshot(quiet_l, quiet_r, sr, noise_rms=0.002)
+    assert qprob >= GUNSHOT_MIN_PROB
+
+    # Nearby footstep thump: low-frequency, should stay below the gate.
+    thump = np.exp(-t * 35.0) * np.sin(2 * np.pi * 160 * t) * 0.22
+    fprob, _ = detect_gunshot(thump, thump, sr, noise_rms=0.01)
+    assert fprob < GUNSHOT_MIN_PROB
 
     mgr = ShotEventManager()
     a = ShotEvent(t0=10.0, rel_deg=35.0, gunshot_prob=0.9, dir_conf=0.7)
@@ -99,6 +130,7 @@ def main() -> int:
     test_heading_visual_then_correct()
     test_large_heading_error_snaps()
     test_predictor_confirm_and_motion()
+    test_predictor_coasts_when_flow_drops()
     test_blend()
     test_audio_ild_right_positive()
     print("TRACKING MATH OK")

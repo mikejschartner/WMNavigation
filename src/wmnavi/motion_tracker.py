@@ -27,7 +27,7 @@ class MotionSample:
 
 
 class MotionTracker(QObject):
-    """Background ~20 Hz loop. Emits samples on the creating (UI) thread via queued Signal."""
+    """Background ~35 Hz loop. Emits samples on the creating (UI) thread via queued Signal."""
 
     sample = Signal(object)
 
@@ -61,7 +61,7 @@ class MotionTracker(QObject):
 
     def _loop(self):
         prev = None
-        last_emit = time.perf_counter()
+        last_t = time.perf_counter()
         frames = 0
         fps_t = time.perf_counter()
         while True:
@@ -69,10 +69,11 @@ class MotionTracker(QObject):
                 if not self._running:
                     break
             t0 = time.perf_counter()
-            result = self._step(prev)
+            result = self._step(prev, t0 - last_t)
             if result is None:
-                time.sleep(0.08)
+                time.sleep(0.04)
                 continue
+            last_t = t0
             prev, motion = result
             if motion.capture_ok:
                 self.last_sample = motion
@@ -86,10 +87,10 @@ class MotionTracker(QObject):
                 frames = 0
                 fps_t = now
             elapsed = now - t0
-            time.sleep(max(0.01, 0.05 - elapsed))
+            time.sleep(max(0.004, 0.028 - elapsed))
         self.fps = 0.0
 
-    def _step(self, prev_gray):
+    def _step(self, prev_gray, dt_hint: float = 0.03):
         try:
             import cv2
             import numpy as np
@@ -97,32 +98,32 @@ class MotionTracker(QObject):
             time.sleep(0.25)
             return None
         t0 = time.perf_counter()
-        frame = capture_eft_bgr(320)
+        frame = capture_eft_bgr(360)
         if frame is None:
-            time.sleep(0.12)
+            time.sleep(0.08)
             return None
         h, w = frame.shape[:2]
-        y0, y1 = int(h * 0.18), int(h * 0.78)
-        x0, x1 = int(w * 0.18), int(w * 0.82)
+        y0, y1 = int(h * 0.16), int(h * 0.80)
+        x0, x1 = int(w * 0.16), int(w * 0.84)
         crop = frame[y0:y1, x0:x1]
         if crop.size == 0:
             return None
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        dt = max(0.012, min(0.12, float(dt_hint) if dt_hint > 0 else 0.03))
         if prev_gray is None or prev_gray.shape != gray.shape:
-            return gray, MotionSample(0.05, 0.0, 0.0, 0.0, 0.05, True, (time.perf_counter() - t0) * 1000)
+            return gray, MotionSample(dt, 0.0, 0.0, 0.0, 0.05, True, (time.perf_counter() - t0) * 1000)
         flow = cv2.calcOpticalFlowFarneback(
-            prev_gray, gray, None, 0.5, 2, 15, 2, 5, 1.1, 0
+            prev_gray, gray, None, 0.5, 2, 13, 2, 5, 1.1, 0
         )
         fx = flow[:, :, 0]
         fy = flow[:, :, 1]
         mag = np.hypot(fx, fy)
         mean_mag = float(np.mean(mag))
-        if mean_mag < 0.04:
-            conf = 0.15
+        if mean_mag < 0.03:
+            conf = 0.18
         else:
-            # Consistency: rotation is spatially uniform horizontal flow.
-            conf = float(min(1.0, mean_mag / 2.2))
+            conf = float(min(1.0, mean_mag / 1.8))
             std_fx = float(np.std(fx))
             if std_fx > 6.0:
                 conf *= 0.55
@@ -132,8 +133,7 @@ class MotionTracker(QObject):
         ch, cw = gray.shape
         lower = fy[int(ch * 0.45) :, :]
         fwd_flow = float(np.median(lower))
-        turning = abs(yaw_flow) > 0.55
+        turning = abs(yaw_flow) > 0.45
         strafe_flow = 0.0 if turning else float(np.median(residual_x))
-        dt = 0.05
         ms = (time.perf_counter() - t0) * 1000
         return gray, MotionSample(dt, yaw_flow, fwd_flow, strafe_flow, conf, True, ms)

@@ -12,6 +12,7 @@ from PySide6.QtCore import QObject, Signal
 from .audio_capture import CaptureInfo, find_wasapi_loopback
 from .audio_detect import (
     DetectDebug,
+    GUNSHOT_MIN_PROB,
     ShotEvent,
     ShotEventManager,
     detect_gunshot,
@@ -19,10 +20,10 @@ from .audio_detect import (
 )
 from .heading import wrap_deg
 
-GUNSHOT_THRESHOLD = 0.58
-DIR_SHOW_THRESHOLD = 0.18
-HOP_S = 0.012
-WINDOW_S = 0.032
+GUNSHOT_THRESHOLD = GUNSHOT_MIN_PROB
+DIR_SHOW_THRESHOLD = 0.10
+HOP_S = 0.010
+WINDOW_S = 0.028
 
 
 class AudioShotService(QObject):
@@ -38,7 +39,7 @@ class AudioShotService(QObject):
         self.last_latency_ms = 0.0
         self.last_shot_at = 0.0
         self._running = False
-        self._noise = 0.02
+        self._noise = 0.003
         self._mic = None
         self._worker: threading.Thread | None = None
         self._heading_fn = None
@@ -118,12 +119,16 @@ class AudioShotService(QObject):
 
     def _analyze_window(self, left, right, sr: int, t_cap: float, last_fire: float) -> float:
         rms = math.sqrt(0.5 * (float(np.mean(left * left)) + float(np.mean(right * right))) + 1e-12)
-        if rms < self._noise * 2.2:
-            self._noise = 0.92 * self._noise + 0.08 * max(rms, 1e-5)
+        if rms < self._noise * 2.4:
+            self._noise = 0.86 * self._noise + 0.14 * max(rms, 8e-7)
+        else:
+            # Creep the floor up slowly so a quiet raid does not freeze a high floor.
+            self._noise = min(0.02, 0.9994 * self._noise + 0.0006 * rms)
+        self._noise = max(4e-6, min(0.02, self._noise))
         prob, dbg = detect_gunshot(left, right, sr, self._noise)
         self.debug = dbg
         now = time.perf_counter()
-        if prob < GUNSHOT_THRESHOLD or (now - last_fire) < 0.07:
+        if prob < GUNSHOT_THRESHOLD or (now - last_fire) < 0.055:
             return last_fire
         deg, dconf, hemi, ddbg = estimate_direction(left, right, sr)
         dbg.rel_deg = deg

@@ -100,7 +100,7 @@ class AudioIndicatorHud(QWidget):
         _set_window_long(hwnd, GWL_EXSTYLE, style)
 
     def _view_yaw(self) -> float | None:
-        if self.compass_visible and self.heading.has_heading:
+        if self.heading.has_heading:
             return self.heading.game_yaw
         return None
 

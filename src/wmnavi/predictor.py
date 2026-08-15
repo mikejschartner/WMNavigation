@@ -138,21 +138,34 @@ class MovementPredictor:
             self._learn(dt, actual_dist, actual_dx, actual_dz, player.yaw_deg, pred_err, yaw_err)
             if pred_err > 8.0:
                 st.predicted_x, st.predicted_z = player.x, player.z
-                st.confidence = 0.35
-            elif pred_err > 2.5:
-                t = 0.72
-                st.predicted_x += (player.x - st.predicted_x) * t
-                st.predicted_z += (player.z - st.predicted_z) * t
                 st.confidence = 0.55
-            else:
-                t = 0.38
+            elif pred_err > 2.5:
+                t = 0.62
                 st.predicted_x += (player.x - st.predicted_x) * t
                 st.predicted_z += (player.z - st.predicted_z) * t
-                st.confidence = 0.92
+                st.confidence = 0.72
+            else:
+                t = 0.28
+                st.predicted_x += (player.x - st.predicted_x) * t
+                st.predicted_z += (player.z - st.predicted_z) * t
+                st.confidence = 0.96
+            if dt > 0.2 and actual_dist < 25.0:
+                vx, vz = actual_dx / dt, actual_dz / dt
+                spd = math.hypot(vx, vz)
+                if spd > MAX_MPS:
+                    s = MAX_MPS / spd
+                    vx, vz = vx * s, vz * s
+                    spd = MAX_MPS
+                st.vx, st.vz, st.speed = vx, vz, spd
+            else:
+                st.vx, st.vz, st.speed = 0.0, 0.0, 0.0
         else:
             st.predicted_x, st.predicted_z = player.x, player.z
             st.confidence = 1.0
             st.last_error_m = 0.0
+            st.vx = 0.0
+            st.vz = 0.0
+            st.speed = 0.0
 
         st.confirmed_x, st.confirmed_y, st.confirmed_z = player.x, player.y, player.z
         st.confirmed_yaw = player.yaw_deg
@@ -162,8 +175,6 @@ class MovementPredictor:
         st.has_fix = True
         st.last_confirm_at = now
         st.loc_ms = loc_ms
-        st.vx = 0.0
-        st.vz = 0.0
         self._integ_yaw_flow = 0.0
         self._integ_fwd_flow = 0.0
         self._integ_strafe_flow = 0.0
@@ -176,7 +187,7 @@ class MovementPredictor:
         dt = max(0.01, min(0.12, float(sample.dt or 0.05)))
         conf = float(sample.feature_conf if sample.capture_ok else 0.0)
         yaw_delta = -sample.yaw_flow_px * self.calib.yaw_deg_per_px
-        if conf >= 0.12 and sample.capture_ok:
+        if conf >= 0.08 and sample.capture_ok:
             self.state.predicted_yaw = wrap_deg(self.state.predicted_yaw + yaw_delta)
             self._integ_yaw_flow += sample.yaw_flow_px
         self._integ_fwd_flow += sample.fwd_flow_px * dt
@@ -187,11 +198,15 @@ class MovementPredictor:
             self.state.speed = 0.0
             return
 
-        if conf < 0.12 or not sample.capture_ok:
-            self.state.vx *= 0.82
-            self.state.vz *= 0.82
+        if conf < 0.10 or not sample.capture_ok:
+            # Coast on last velocity so the marker does not freeze between frames.
+            self.state.vx *= 0.90
+            self.state.vz *= 0.90
+            self.state.predicted_x += self.state.vx * dt
+            self.state.predicted_z += self.state.vz * dt
             self.state.speed = math.hypot(self.state.vx, self.state.vz)
-            self._decay_confidence(dt, extra=0.08)
+            self._decay_confidence(dt, extra=0.01)
+            self._clamp_bounds(bounds, rotation, transform)
             return
 
         yaw = math.radians(self.state.predicted_yaw)
@@ -200,9 +215,9 @@ class MovementPredictor:
         fwd_mps = max(-SPRINT_MPS, min(SPRINT_MPS, sample.fwd_flow_px * self.calib.fwd_mps_per_px))
         strafe_mps = max(-WALK_MPS, min(WALK_MPS, sample.strafe_flow_px * self.calib.strafe_mps_per_px))
         # Deadzone so idle camera noise does not walk the marker.
-        if abs(sample.fwd_flow_px) < 0.18:
+        if abs(sample.fwd_flow_px) < 0.12:
             fwd_mps = 0.0
-        if abs(sample.strafe_flow_px) < 0.18:
+        if abs(sample.strafe_flow_px) < 0.12:
             strafe_mps = 0.0
         vx = fwd_x * fwd_mps + right_x * strafe_mps
         vz = fwd_z * fwd_mps + right_z * strafe_mps
@@ -212,17 +227,18 @@ class MovementPredictor:
             vx *= scale
             vz *= scale
             speed = MAX_MPS
-        self.state.vx = vx
-        self.state.vz = vz
-        self.state.speed = speed
-        self.state.predicted_x += vx * dt
-        self.state.predicted_z += vz * dt
+        # Blend with coasting velocity so a single noisy frame does not stall.
+        self.state.vx = self.state.vx * 0.35 + vx * 0.65
+        self.state.vz = self.state.vz * 0.35 + vz * 0.65
+        self.state.speed = math.hypot(self.state.vx, self.state.vz)
+        self.state.predicted_x += self.state.vx * dt
+        self.state.predicted_z += self.state.vz * dt
         age = self.time_since_confirm()
-        self._decay_confidence(dt, extra=0.02 * age)
-        if self.state.confidence < 0.22:
-            # Freeze toward last confirmed — do not keep drifting.
-            self.state.predicted_x += (self.state.confirmed_x - self.state.predicted_x) * min(1.0, dt * 2.5)
-            self.state.predicted_z += (self.state.confirmed_z - self.state.predicted_z) * min(1.0, dt * 2.5)
+        self._decay_confidence(dt, extra=0.004 * min(age, 8.0))
+        if age > 18.0 and self.state.confidence < 0.12:
+            # Only freeze after a long gap with no V ping — not every few seconds.
+            self.state.predicted_x += (self.state.confirmed_x - self.state.predicted_x) * min(1.0, dt * 1.4)
+            self.state.predicted_z += (self.state.confirmed_z - self.state.predicted_z) * min(1.0, dt * 1.4)
             self.state.vx = 0.0
             self.state.vz = 0.0
             self.state.speed = 0.0
@@ -249,7 +265,7 @@ class MovementPredictor:
         )
 
     def _decay_confidence(self, dt: float, extra: float = 0.0):
-        self.state.confidence = max(0.0, self.state.confidence - dt * (0.12 + extra))
+        self.state.confidence = max(0.18, self.state.confidence - dt * (0.03 + extra))
 
     def _clamp_bounds(self, bounds, rotation, transform):
         if not bounds or not transform or not self.state.has_fix:

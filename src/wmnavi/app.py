@@ -238,6 +238,8 @@ class MainWindow(QMainWindow):
             self.start_watchers()
         except Exception:
             pass
+        if self.settings.value("ai_prediction", True, type=bool):
+            self.btn_ai_prediction.setChecked(True)
         self._friend_prune_timer.start()
         QTimer.singleShot(300, self._start_global_hotkeys)
 
@@ -432,8 +434,10 @@ class MainWindow(QMainWindow):
         self.live_interval = QSpinBox()
         self.live_interval.setRange(2, 60)
         self.live_interval.setSuffix(" s")
-        self.live_interval.setValue(int(self.settings.value("live_interval", 5)))
-        self.live_interval.setToolTip("Seconds between automatic V screenshots")
+        self.live_interval.setValue(int(self.settings.value("live_interval", 3)))
+        self.live_interval.setToolTip(
+            "Seconds between automatic V screenshots. Prediction fills the gaps — 2–3s is enough."
+        )
         self.live_interval.valueChanged.connect(self.on_live_interval_changed)
         live_row.addWidget(self.live_interval)
         bottom_layout.addLayout(live_row)
@@ -580,8 +584,8 @@ class MainWindow(QMainWindow):
         self.btn_ai_prediction = QPushButton("AI Prediction")
         self.btn_ai_prediction.setCheckable(True)
         self.btn_ai_prediction.setToolTip(
-            "Optional: estimate movement between V pings using lightweight visual tracking.\n"
-            "Right-click to reset learned calibration. Screenshot localization stays ground truth."
+            "On by default: estimate movement between V pings from the Tarkov view.\n"
+            "Keeps the map marker and compass turning in real time. Right-click to reset calibration."
         )
         self.btn_ai_prediction.toggled.connect(self.on_ai_prediction_toggled)
         self.btn_ai_prediction.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -590,7 +594,7 @@ class MainWindow(QMainWindow):
         self.btn_audio_indicator = QPushButton("Audio Indicator")
         self.btn_audio_indicator.setCheckable(True)
         self.btn_audio_indicator.setToolTip(
-            "Optional: listen to game output for gunshots and show a brief top-of-screen direction.\n"
+            "Listen to game output for gunshots (including distant ones) and show direction on screen.\n"
             "Does not mute or reroute Tarkov audio. Independent of Compass and AI Prediction."
         )
         self.btn_audio_indicator.toggled.connect(self.on_audio_indicator_toggled)
@@ -1893,6 +1897,7 @@ class MainWindow(QMainWindow):
 
     def on_ai_prediction_toggled(self, on: bool):
         self._ai_prediction_on = bool(on)
+        self.settings.setValue("ai_prediction", self._ai_prediction_on)
         self._sync_motion_tracker()
         if not on:
             self.map_view.set_confirmed_ghost(None)
@@ -1905,7 +1910,7 @@ class MainWindow(QMainWindow):
         self._update_tracking_debug()
 
     def _audio_game_yaw(self):
-        if self._compass_on() and self.heading.has_heading:
+        if self.heading.has_heading:
             return float(self.heading.game_yaw)
         return None
 
@@ -2000,6 +2005,11 @@ class MainWindow(QMainWindow):
             self.predictor.state.predicted_yaw = self.heading.game_yaw
         if self._ai_prediction_on:
             self._apply_live_marker()
+            live = self._live_player_state()
+            if live and self.compass is not None:
+                self.compass.set_player_xz(live.x, live.z)
+            if live:
+                self.heading.set_player_xz(live.x, live.z)
         self._update_tracking_debug()
 
     def _update_tracking_debug(self):

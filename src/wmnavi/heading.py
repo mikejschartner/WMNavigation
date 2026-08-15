@@ -66,9 +66,9 @@ class HeadingTracker:
     at ~60 FPS only lerps the displayed needle — it does not invent heading.
     """
 
-    LERP_RATE = 22.0
-    SNAP_DEG = 0.15
-    LARGE_ERR_DEG = 22.0
+    LERP_RATE = 58.0
+    SNAP_DEG = 0.08
+    LARGE_ERR_DEG = 28.0
 
     def __init__(self):
         self.authoritative = 0.0
@@ -114,10 +114,10 @@ class HeadingTracker:
 
     def apply_visual_yaw(self, game_yaw_delta_deg: float, confidence: float):
         """Integrate camera turn between localization pings (game-space degrees)."""
-        if not self.has_heading or confidence < 0.12:
+        if not self.has_heading or confidence < 0.08:
             return
         delta = float(game_yaw_delta_deg)
-        if abs(delta) < 0.02:
+        if abs(delta) < 0.008:
             return
         self.game_yaw = wrap_deg(self.game_yaw + delta)
         if self._xz is not None:
@@ -130,6 +130,9 @@ class HeadingTracker:
             )
         else:
             self.predicted = wrap_deg(self.predicted + delta)
+
+    def set_player_xz(self, x: float, z: float):
+        self._xz = (float(x), float(z))
 
     def tick(self) -> float:
         now = time.perf_counter()
