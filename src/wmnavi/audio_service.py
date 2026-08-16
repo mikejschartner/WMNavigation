@@ -21,6 +21,8 @@ from .audio_detect import (
 from .heading import wrap_deg
 
 GUNSHOT_THRESHOLD = GUNSHOT_MIN_PROB
+FOOTSTEP_THRESHOLD = 0.52
+EXPLOSION_THRESHOLD = 0.55
 DIR_SHOW_THRESHOLD = 0.10
 HOP_S = 0.010
 WINDOW_S = 0.028
@@ -43,9 +45,14 @@ class AudioShotService(QObject):
         self._mic = None
         self._worker: threading.Thread | None = None
         self._heading_fn = None
+        self._motion_fn = None
+        self._step_times: list[float] = []
 
     def set_heading_provider(self, fn):
         self._heading_fn = fn
+
+    def set_motion_provider(self, fn):
+        self._motion_fn = fn
 
     @property
     def active(self) -> bool:
@@ -125,14 +132,55 @@ class AudioShotService(QObject):
             # Creep the floor up slowly so a quiet raid does not freeze a high floor.
             self._noise = min(0.02, 0.9994 * self._noise + 0.0006 * rms)
         self._noise = max(4e-6, min(0.02, self._noise))
-        prob, dbg = detect_gunshot(left, right, sr, self._noise)
+        gun, dbg = detect_gunshot(left, right, sr, self._noise)
+        speed = 0.0
+        keys_moving = False
+        if self._motion_fn:
+            try:
+                info = self._motion_fn() or {}
+                speed = float(info.get("speed") or 0.0)
+                keys_moving = bool(info.get("keys_moving"))
+            except Exception:
+                speed = 0.0
+        moving = speed > 0.45 or keys_moving
+        dbg.moving = moving
+        dbg.speed = speed
+        self_p = 0.0
+        if moving and dbg.footstep_prob > 0.35:
+            self_p = 0.55
+            expected = 0.38 if speed >= 5.0 or keys_moving else 0.50
+            if self._step_times:
+                dt = now_pre = time.perf_counter() - self._step_times[-1]
+                err = min(abs(dt - expected), abs(dt - expected * 2))
+                if err < 0.11:
+                    self_p = 0.92
+                elif dt < 0.18:
+                    self_p = 0.8
+            if dbg.gunshot_prob > 0.55:
+                self_p *= 0.25
+        dbg.self_footstep_prob = self_p
         self.debug = dbg
         now = time.perf_counter()
-        if prob < GUNSHOT_THRESHOLD or (now - last_fire) < 0.055:
+
+        emit_kind = ""
+        if gun >= GUNSHOT_THRESHOLD:
+            emit_kind = "gunshot"
+        elif dbg.kind == "explosion" and dbg.explosion_prob >= EXPLOSION_THRESHOLD:
+            emit_kind = "explosion"
+        elif dbg.kind == "footstep" and dbg.footstep_prob >= FOOTSTEP_THRESHOLD:
+            if self_p >= 0.78:
+                self._step_times.append(now)
+                self._step_times = self._step_times[-8:]
+                return last_fire
+            emit_kind = "footstep"
+
+        if not emit_kind or (now - last_fire) < (0.055 if emit_kind == "gunshot" else 0.12):
             return last_fire
+
         deg, dconf, hemi, ddbg = estimate_direction(left, right, sr)
         dbg.rel_deg = deg
         dbg.dir_conf = dconf
+        dbg.angle_conf = ddbg.angle_conf
         dbg.ild_db = ddbg.ild_db
         dbg.itd_ms = ddbg.itd_ms
         self.debug = dbg
@@ -150,14 +198,20 @@ class AudioShotService(QObject):
         ev = ShotEvent(
             t0=now,
             rel_deg=deg,
-            gunshot_prob=prob,
+            gunshot_prob=gun if emit_kind == "gunshot" else dbg.footstep_prob,
             dir_conf=dconf,
             world_bearing=world,
             latency_ms=latency,
             hemisphere=hemi,
+            kind=emit_kind,
+            angle_conf=float(ddbg.angle_conf or dconf),
+            self_step=self_p,
         )
         clustered = self.manager.ingest(ev)
         self.last_latency_ms = latency
         self.last_shot_at = now
+        if emit_kind == "footstep":
+            self._step_times.append(now)
+            self._step_times = self._step_times[-8:]
         self.shot.emit(clustered)
         return now

@@ -220,6 +220,11 @@ def _merge_prices(dest: dict[str, ItemInfo], source: dict[str, ItemInfo]) -> Non
                 cur.trader_name = src.trader_name
 
 
+def load_items_catalog(mode: str) -> dict[str, ItemInfo]:
+    """Full item dump for the game mode (prices + names + icon URLs)."""
+    return _load_items_dump(mode)
+
+
 def _load_items_dump(mode: str) -> dict[str, ItemInfo]:
     cache_file = cache_dir() / f"{mode}_items.json"
     if cache_file.exists():

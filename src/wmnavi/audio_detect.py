@@ -28,7 +28,10 @@ class ShotEvent:
     latency_ms: float = 0.0
     count: int = 1
     last_t: float = 0.0
-    hemisphere: str = "unknown"  # unknown | front | rear
+    hemisphere: str = "unknown"
+    kind: str = "gunshot"  # gunshot | footstep | explosion
+    angle_conf: float = 0.0
+    self_step: float = 0.0
 
 
 @dataclass
@@ -40,11 +43,20 @@ class DetectDebug:
     high_ratio: float = 0.0
     onset: float = 0.0
     gunshot_prob: float = 0.0
+    footstep_prob: float = 0.0
+    self_footstep_prob: float = 0.0
+    explosion_prob: float = 0.0
+    other_prob: float = 0.0
+    flux: float = 0.0
+    kind: str = "other"
     rel_deg: float = 0.0
     dir_conf: float = 0.0
+    angle_conf: float = 0.0
     ild_db: float = 0.0
     itd_ms: float = 0.0
     analyze_ms: float = 0.0
+    moving: bool = False
+    speed: float = 0.0
 
 
 def _band_energy(spec: np.ndarray, freqs: np.ndarray, lo: float, hi: float) -> float:
@@ -155,16 +167,52 @@ def detect_gunshot(left: np.ndarray, right: np.ndarray, sr: int, noise_rms: floa
         score -= 0.30
     if peak < 0.0035 and onset < 1.25:
         score = 0.0
-    prob = max(0.0, min(1.0, score))
+    gun = max(0.0, min(1.0, score))
+
+    band_80_250 = _band_energy(spec, freqs, 80.0, 250.0) / total
+    foot = 0.0
+    if body_ratio > 0.32 and high_ratio < 0.30:
+        foot += 0.28
+    if band_80_250 > 0.22 and crest < 8.0:
+        foot += 0.26
+    if 1.3 < onset < 4.5 and high_ratio < 0.26:
+        foot += 0.22
+    if crest < 5.5:
+        foot += 0.12
+    if gun > 0.55:
+        foot *= 0.35
+    foot = max(0.0, min(1.0, foot))
+
+    expl = 0.0
+    if low / total > 0.55 and peak > 0.04 and crest < 5.0:
+        expl += 0.4
+    if band_80_250 > 0.35 and onset > 2.0 and high_ratio < 0.18:
+        expl += 0.25
+    expl = max(0.0, min(1.0, expl * (0.4 if gun > 0.6 else 1.0)))
+
+    other = max(0.0, 1.0 - max(gun, foot, expl))
+    kind = "other"
+    best = other
+    if gun >= best:
+        kind, best = "gunshot", gun
+    if foot > best:
+        kind, best = "footstep", foot
+    if expl > best:
+        kind, best = "explosion", expl
+
     dbg.rms_l = rms_l
     dbg.rms_r = rms_r
     dbg.peak = peak
     dbg.crest = crest
     dbg.high_ratio = high_ratio
     dbg.onset = onset
-    dbg.gunshot_prob = prob
+    dbg.gunshot_prob = gun
+    dbg.footstep_prob = foot
+    dbg.explosion_prob = expl
+    dbg.other_prob = other
+    dbg.kind = kind
     dbg.analyze_ms = (time.perf_counter() - t0) * 1000.0
-    return prob, dbg
+    return gun, dbg
 
 
 def estimate_direction(left: np.ndarray, right: np.ndarray, sr: int) -> tuple[float, float, str, DetectDebug]:
@@ -180,6 +228,11 @@ def estimate_direction(left: np.ndarray, right: np.ndarray, sr: int) -> tuple[fl
         deg, conf = ild_deg, ild_conf
     else:
         deg, conf = itd_deg, itd_conf * 0.85
+    angle_conf = conf
+    if abs(ild_deg - itd_deg) > 28:
+        angle_conf *= 0.42
+    if ild_conf < 0.2 and itd_conf < 0.2:
+        angle_conf *= 0.35
     # Front/back from stereo mix is unreliable — keep hemisphere unknown unless HF is very dull.
     mix = 0.5 * (left + right)
     spec = np.abs(np.fft.rfft(mix * np.hanning(len(mix)))) ** 2
@@ -195,6 +248,7 @@ def estimate_direction(left: np.ndarray, right: np.ndarray, sr: int) -> tuple[fl
         rms_r=rms_r,
         rel_deg=deg,
         dir_conf=conf,
+        angle_conf=angle_conf,
         ild_db=ild_db,
         itd_ms=itd_ms,
     )
@@ -216,6 +270,8 @@ class ShotEventManager:
             if existing.world_bearing is not None and event.world_bearing is not None:
                 ddeg = abs(shortest_delta(existing.world_bearing, event.world_bearing))
             if dt <= CLUSTER_DT_S and ddeg <= CLUSTER_DEG:
+                if getattr(existing, "kind", "gunshot") != getattr(event, "kind", "gunshot"):
+                    continue
                 existing.count += 1
                 existing.last_t = now
                 existing.gunshot_prob = max(existing.gunshot_prob, event.gunshot_prob)

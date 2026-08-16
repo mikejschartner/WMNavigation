@@ -125,6 +125,53 @@ def test_audio_ild_right_positive():
     assert abs(mgr.display_rel(world, 150.0) - 10.0) < 0.01
 
 
+def test_audio_classes():
+    import numpy as np
+    from wmnavi.audio_detect import GUNSHOT_MIN_PROB, detect_gunshot
+
+    sr = 48000
+    n = int(0.03 * sr)
+    t = np.arange(n) / sr
+    burst = np.exp(-t * 180.0) * np.sin(2 * np.pi * 3200 * t) * 0.02
+    g, dbg = detect_gunshot(burst, burst * 0.8, sr, 0.002)
+    assert g >= GUNSHOT_MIN_PROB
+    assert dbg.kind == "gunshot"
+    thump = np.exp(-t * 35.0) * np.sin(2 * np.pi * 160 * t) * 0.22
+    g2, d2 = detect_gunshot(thump, thump, sr, 0.01)
+    assert g2 < GUNSHOT_MIN_PROB
+    assert d2.footstep_prob > d2.gunshot_prob
+
+
+def test_loot_index_roundtrip():
+    import sys
+
+    import cv2
+    import numpy as np
+    from PySide6.QtWidgets import QApplication
+
+    from wmnavi.loot_index import ItemIconIndex, transform_for_benchmark
+    from wmnavi.loot_loader import load_items_catalog
+
+    if QApplication.instance() is None:
+        QApplication(sys.argv)
+    catalog = load_items_catalog("regular") or load_items_catalog("pvp-season") or {}
+    idx = ItemIconIndex()
+    n = idx.build(catalog)
+    if n < 8:
+        return
+    hits = 0
+    for entry in idx.entries[:12]:
+        bgr = cv2.cvtColor(entry.gray, cv2.COLOR_GRAY2BGR)
+        cands = idx.query(bgr, top_k=5)
+        if cands and cands[0][0] == entry.item_id:
+            hits += 1
+        scaled = transform_for_benchmark(bgr, "scaled")
+        c2 = idx.query(scaled, top_k=5)
+        if c2 and c2[0][0] == entry.item_id:
+            hits += 1
+    assert hits >= 8
+
+
 def main() -> int:
     test_wrap_and_shortest()
     test_heading_visual_then_correct()
@@ -133,6 +180,8 @@ def main() -> int:
     test_predictor_coasts_when_flow_drops()
     test_blend()
     test_audio_ild_right_positive()
+    test_audio_classes()
+    test_loot_index_roundtrip()
     print("TRACKING MATH OK")
     return 0
 

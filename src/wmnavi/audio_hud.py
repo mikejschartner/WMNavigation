@@ -142,16 +142,25 @@ class AudioIndicatorHud(QWidget):
             rel = self.manager.display_rel(ev, yaw)
             x = x_for(rel)
             alpha = int(40 + 200 * fade * min(1.0, 0.45 + ev.dir_conf))
-            color = QColor(251, 146, 60, alpha)
-            if abs(rel) < 18:
-                color = QColor(250, 204, 21, alpha)
+            kind = getattr(ev, "kind", "gunshot")
+            if kind == "footstep":
+                color = QColor(56, 189, 248, alpha)
+            elif kind == "explosion":
+                color = QColor(248, 113, 113, alpha)
+            else:
+                color = QColor(251, 146, 60, alpha)
+                if abs(rel) < 18:
+                    color = QColor(250, 204, 21, alpha)
             painter.setBrush(color)
             painter.setPen(QPen(QColor(10, 10, 16, min(200, alpha)), 1))
+            spread = 7
+            if getattr(ev, "angle_conf", 1.0) < 0.45:
+                spread = 16
             tri = QPolygon(
                 [
                     QPoint(int(x), h - 9),
-                    QPoint(int(x - 7), 14),
-                    QPoint(int(x + 7), 14),
+                    QPoint(int(x - spread), 14),
+                    QPoint(int(x + spread), 14),
                 ]
             )
             painter.drawPolygon(tri)
@@ -166,7 +175,8 @@ class AudioIndicatorHud(QWidget):
                 w - 16,
                 14,
                 Qt.AlignmentFlag.AlignLeft,
-                f"L {d.rms_l:.3f}  R {d.rms_r:.3f}  p {d.gunshot_prob:.2f}  {d.rel_deg:+.0f}° c {d.dir_conf:.2f}",
+                f"L {d.rms_l:.3f}  R {d.rms_r:.3f}  g {d.gunshot_prob:.2f} f {getattr(d,'footstep_prob',0):.2f} "
+                f"self {getattr(d,'self_footstep_prob',0):.2f}  {d.rel_deg:+.0f}° c {d.dir_conf:.2f}",
             )
 
         painter.end()

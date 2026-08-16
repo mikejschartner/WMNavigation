@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import pkgutil
+import runpy
 import sys
 import traceback
 from pathlib import Path
@@ -41,17 +42,14 @@ def main() -> int:
 
     try:
         _import_all()
-        from pathlib import Path
-        import runpy
-
+        app = QApplication.instance() or QApplication(sys.argv)
+        app.setApplicationName("WMNavigation-smoke")
         math_test = Path(__file__).resolve().parent / "test_tracking_math.py"
         try:
             runpy.run_path(str(math_test), run_name="__main__")
         except SystemExit as exc:
             if exc.code not in (0, None):
                 raise RuntimeError(f"tracking math tests failed: {exc.code}") from exc
-        app = QApplication(sys.argv)
-        app.setApplicationName("WMNavigation-smoke")
         window = MainWindow()
         window.show()
         QTimer.singleShot(400, app.quit)
@@ -63,6 +61,8 @@ def main() -> int:
         has_art = mv.map_item is not None or mv._tile_item is not None
         if not has_art:
             raise RuntimeError("map graphic missing after MainWindow load")
+        if not hasattr(window, "btn_loot_value"):
+            raise RuntimeError("Loot Value button missing")
         rect = mv.scene.sceneRect()
         if rect.width() < 40 or rect.height() < 40:
             raise RuntimeError(f"map scene empty: {rect}")

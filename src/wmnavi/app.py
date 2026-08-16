@@ -38,6 +38,7 @@ from . import __version__
 from .assets import cache_remote_file
 from .audio_hud import AudioIndicatorHud
 from .audio_service import AudioShotService
+from .loot_service import LootValueService
 from .compass import CompassHud
 from .coords import PlayerState
 from .extract_panel import ExtractAvailabilityPanel, unique_extracts
@@ -81,7 +82,7 @@ from .quest_log_sync import (
 from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
 from .theme import STYLESHEET
-from .win_input import press_v_in_raid
+from .win_input import movement_keys, press_v_in_raid
 
 
 class ScreenshotHandler(FileSystemEventHandler):
@@ -205,11 +206,15 @@ class MainWindow(QMainWindow):
         self._tracking_debug = False
         self.audio = AudioShotService(self)
         self.audio.set_heading_provider(self._audio_game_yaw)
+        self.audio.set_motion_provider(self._audio_motion)
         self.audio.shot.connect(self._on_audio_shot)
         self.audio.failed.connect(self._on_audio_failed)
         self.audio.started.connect(self._on_audio_started)
         self.audio_hud = AudioIndicatorHud(self.heading, self.audio.manager)
         self.audio_hud.debug_fn = lambda: self.audio.debug
+        self.loot = LootValueService(self)
+        self.loot.updated.connect(self._on_loot_updated)
+        self._loot_value_on = False
         self._last_loc_ms = 0.0
         self.nav_graph = NavGraph()
         self._locked_loot_ids: set[str] = set()
@@ -599,6 +604,14 @@ class MainWindow(QMainWindow):
         )
         self.btn_audio_indicator.toggled.connect(self.on_audio_indicator_toggled)
         top_row.addWidget(self.btn_audio_indicator)
+        self.btn_loot_value = QPushButton("Loot Value")
+        self.btn_loot_value.setCheckable(True)
+        self.btn_loot_value.setToolTip(
+            "Hover an item in Tarkov. Uses your existing item pictures and prices.\n"
+            "Only looks at a small area around the cursor — not the whole screen."
+        )
+        self.btn_loot_value.toggled.connect(self.on_loot_value_toggled)
+        top_row.addWidget(self.btn_loot_value)
         map_layout.addWidget(map_top)
 
         self.tracking_debug_label = QLabel("")
@@ -745,6 +758,9 @@ class MainWindow(QMainWindow):
             self.load_map(self.current_map_slug, force_fetch=False)
         except Exception as exc:
             self.status_label.setText(f"Map load failed: {exc}")
+        if self._loot_value_on:
+            self.loot.stop()
+            self.loot.start(self.current_game_mode)
 
     def _update_price_labels(self):
         self.price_value.setText(f"₽{self.price_slider.value():,}")
@@ -1710,6 +1726,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            self.loot.shutdown()
+        except Exception:
+            pass
+        try:
             self.hotkeys.stop()
         except Exception:
             pass
@@ -1914,6 +1934,34 @@ class MainWindow(QMainWindow):
             return float(self.heading.game_yaw)
         return None
 
+    def _audio_motion(self):
+        keys = movement_keys()
+        keys_moving = bool(keys.get("forward") or keys.get("back") or keys.get("left") or keys.get("right"))
+        speed = float(self.predictor.state.speed or 0.0) if self.predictor.state.has_fix else 0.0
+        return {"speed": speed, "keys_moving": keys_moving}
+
+    def on_loot_value_toggled(self, on: bool):
+        self._loot_value_on = bool(on)
+        self.loot.set_debug(self._tracking_debug)
+        if on:
+            self.loot.start(self.current_game_mode)
+            n = self.loot.index_size
+            self.status_label.setText(
+                f"Loot Value on · {n} cached item pictures · hover an item in Tarkov"
+            )
+            if n == 0:
+                self.status_label.setText(
+                    "Loot Value on · no cached item pictures yet. Open Filter Items once so icons download."
+                )
+        else:
+            self.loot.stop()
+            self.status_label.setText("Loot Value off")
+        self._update_tracking_debug()
+
+    def _on_loot_updated(self, _match):
+        if self._tracking_debug:
+            self._update_tracking_debug()
+
     def on_audio_indicator_toggled(self, on: bool):
         self._audio_indicator_on = bool(on)
         self.audio_hud.debug = self._tracking_debug
@@ -1967,6 +2015,7 @@ class MainWindow(QMainWindow):
         self._tracking_debug = bool(on)
         self.tracking_debug_label.setVisible(self._tracking_debug)
         self.audio_hud.debug = self._tracking_debug
+        self.loot.set_debug(self._tracking_debug)
         if self._tracking_debug and self._audio_indicator_on:
             self.audio_hud.note_shot()
         self._apply_live_marker()
@@ -2039,7 +2088,7 @@ class MainWindow(QMainWindow):
             f"{conf_line} · {pred_line} · spd {st.speed:.1f}m/s · "
             f"conf {st.confidence:.2f} · err {st.last_error_m:.1f}m · "
             f"{cal.state_name()} n={cal.samples} · t+{self.predictor.time_since_confirm():.1f}s · "
-            f"loc {st.loc_ms:.1f}ms · {self.motion.fps:.0f} Hz · {flow} · {self._audio_debug_line()}"
+            f"loc {st.loc_ms:.1f}ms · {self.motion.fps:.0f} Hz · {flow} · {self._audio_debug_line()} · {self._loot_debug_line()}"
         )
 
     def _audio_debug_line(self) -> str:
@@ -2058,8 +2107,22 @@ class MainWindow(QMainWindow):
         return (
             f"AUD {status} {cap.device_name[:28]} "
             f"L {dbg.rms_l:.3f} R {dbg.rms_r:.3f} "
-            f"p {dbg.gunshot_prob:.2f} {dbg.rel_deg:+.0f}° dconf {dbg.dir_conf:.2f} "
+            f"p {dbg.gunshot_prob:.2f} f {dbg.footstep_prob:.2f} self {dbg.self_footstep_prob:.2f} "
+            f"{dbg.kind} {dbg.rel_deg:+.0f}° dconf {dbg.dir_conf:.2f} aconf {dbg.angle_conf:.2f} "
             f"yaw {yaw_s} lat {self.audio.last_latency_ms:.0f}ms ev [{ev_s}]"
+        )
+
+    def _loot_debug_line(self) -> str:
+        if not self._loot_value_on:
+            return "LOOT off"
+        m = self.loot.last
+        if m is None:
+            return f"LOOT idx {self.loot.index_size}"
+        cands = ",".join(f"{cid[-6:]}:{sc:.2f}" for cid, sc, _h in (m.candidates or [])[:3]) or "-"
+        return (
+            f"LOOT {m.reason} {m.name or m.item_id or '—'} "
+            f"{m.confidence * 100:.0f}% ham {m.hamming} {m.latency_ms:.0f}ms "
+            f"cur {m.cursor[0]},{m.cursor[1]} {'cache' if m.cache_hit else 'live'} [{cands}]"
         )
 
     def _available_extracts(self) -> list:
