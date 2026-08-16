@@ -21,8 +21,8 @@ HOLD_PX = 54  # ~one Tarkov stash cell — keep the last find while the tooltip 
 PATCH = 176
 HIGH_CONF = 0.86
 SHOW_CONF = 0.70
-NAME_CONF = 0.86
-OCR_EVERY = 0.22
+NAME_CONF = 0.84
+OCR_EVERY = 0.12
 CACHE_MAX = 220
 
 
@@ -112,7 +112,7 @@ class HoverRecognizer:
         if not self.names or not self.names._entries:
             return None
         now = time.perf_counter()
-        if now - self._still_since < 0.22:
+        if now - self._still_since < 0.12:
             return None
         if now - self._last_ocr_at < OCR_EVERY:
             return None

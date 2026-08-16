@@ -118,7 +118,7 @@ def capture_eft_bgr(max_width: int = 320):
     return bgr
 
 
-def capture_eft_rect_bgr(x0: int, y0: int, w: int, h: int):
+def capture_eft_rect_bgr(x0: int, y0: int, w: int, h: int, *, min_size: int = 32):
     """Native-resolution crop of a Tarkov client rectangle."""
     try:
         import numpy as np
@@ -136,7 +136,7 @@ def capture_eft_rect_bgr(x0: int, y0: int, w: int, h: int):
     y0 = max(0, int(y0))
     w = min(int(w), cw - x0)
     h = min(int(h), ch - y0)
-    if w < 32 or h < 32:
+    if w < min_size or h < min_size:
         return None
 
     hdc = user32.GetDC(hwnd)
@@ -197,16 +197,24 @@ def capture_eft_patch_bgr(client_x: int, client_y: int, size: int = 192):
 
 
 def capture_eft_tooltip_bgr(client_x: int, client_y: int, client_w: int, client_h: int):
-    """Wider crop around the cursor so the hover name tooltip is in frame."""
+    """Tight crop of the stash name chip: always above and to the right of the cursor.
+
+    Tarkov only changes the box width with the name length. Near the right edge it
+    flips to above-left so the chip stays on screen.
+    """
     cw = max(64, int(client_w))
     ch = max(64, int(client_h))
     cx, cy = int(client_x), int(client_y)
-    box_w, box_h = 640, 520
-    if cw - cx < 300:
-        x0 = max(0, cx - box_w + 80)
+    box_w, box_h = 520, 86
+    gap_x, gap_y = 12, 10
+    if cw - cx < 120:
+        x0 = max(0, cx - gap_x - box_w)
     else:
-        x0 = max(0, cx - 56)
-    y0 = max(0, cy - box_h // 2)
+        x0 = min(max(0, cx + gap_x), max(0, cw - 48))
+    y0 = max(0, cy - gap_y - box_h)
     w = min(box_w, cw - x0)
-    h = min(box_h, ch - y0)
-    return capture_eft_rect_bgr(x0, y0, w, h)
+    h = min(box_h, max(16, cy - gap_y - y0))
+    if h < 16:
+        y0 = max(0, cy - box_h)
+        h = min(box_h, ch - y0)
+    return capture_eft_rect_bgr(x0, y0, w, h, min_size=16)

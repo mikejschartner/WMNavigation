@@ -1,4 +1,4 @@
-"""Find Tarkov's hover name tooltip and read the item name with Windows OCR."""
+"""Find Tarkov's hover name chip (above-right of cursor) and read it with Windows OCR."""
 
 from __future__ import annotations
 
@@ -18,69 +18,107 @@ def warmup_ocr() -> bool:
 
 
 def read_tooltip_name(cx: int, cy: int, client_w: int, client_h: int) -> tuple[str, float]:
-    """Return (ocr_text, band_score). Empty text if the name box is not readable yet."""
+    """Return (ocr_text, score). Empty text if the name chip is not readable yet."""
     frame = capture_eft_tooltip_bgr(cx, cy, client_w, client_h)
     if frame is None:
         return "", 0.0
-    bands = find_title_bands(frame)
-    if not bands:
-        return "", 0.0
+    chips = find_name_chips(frame)
     engine = _ocr_engine()
     if engine is None:
         return "", 0.0
     best_text = ""
     best_score = 0.0
-    for crop, score in bands[:3]:
+    for crop, score in (chips or [])[:3]:
         text = _ocr_image(engine, crop)
-        if text and score >= best_score:
+        if not text:
+            continue
+        if score >= best_score:
             best_text = text
             best_score = score
-    return best_text, best_score
+    if best_text:
+        return best_text, best_score
+    # ROI is already the above-right strip — OCR it if no border was found.
+    text = _ocr_image(engine, frame)
+    return text, 0.35 if text else 0.0
 
 
 def find_title_bands(bgr: np.ndarray) -> list[tuple[np.ndarray, float]]:
-    """Dark UI panels with a bright title strip — Tarkov hover tooltips."""
+    """Back-compat alias used by tests."""
+    return find_name_chips(bgr)
+
+
+def find_name_chips(bgr: np.ndarray) -> list[tuple[np.ndarray, float]]:
+    """Stash hover chip: black fill, thin gray border, one line of white text."""
     import cv2
 
     if bgr is None or bgr.size == 0:
         return []
     h, w = bgr.shape[:2]
-    if h < 40 or w < 80:
+    if h < 16 or w < 40:
         return []
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    dark = (gray < 58).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 13))
-    closed = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel)
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    bands: list[tuple[np.ndarray, float]] = []
+    # Light-gray 1px outline on a dark stash background.
+    edges = cv2.Canny(gray, 35, 110)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    chips: list[tuple[np.ndarray, float]] = []
     for cnt in contours:
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if bw < 150 or bh < 28 or bw > w * 0.98:
+        if bw < 48 or bh < 14 or bh > 72:
             continue
-        if bh > h * 0.9 and bw > w * 0.9:
+        if bw < bh * 1.5:
             continue
-        title_h = min(72, max(28, int(bh * 0.34)))
-        y1 = y + title_h
-        pad = 4
-        xa, ya = max(0, x - pad), max(0, y - pad)
-        xb, yb = min(w, x + bw + pad), min(h, y1 + pad)
+        if bw > w * 0.98 and bh > h * 0.85:
+            continue
+        inset = 2 if bh >= 20 and bw >= 60 else 1
+        xa, ya = x + inset, y + inset
+        xb, yb = x + bw - inset, y + bh - inset
+        if xb - xa < 36 or yb - ya < 10:
+            continue
+        inner = gray[ya:yb, xa:xb]
+        if inner.size == 0:
+            continue
+        mean = float(np.mean(inner))
+        if mean > 55:
+            continue
+        bright = float(np.mean(inner > 150))
+        if bright < 0.018 or bright > 0.55:
+            continue
+        # Border itself should be lighter than the fill.
+        ring = gray[max(0, y) : min(h, y + bh), max(0, x) : min(w, x + bw)]
+        if ring.size and float(np.max(ring)) < 80:
+            continue
         crop = bgr[ya:yb, xa:xb]
-        if crop.size == 0:
-            continue
-        cg = gray[ya:yb, xa:xb]
-        bright = float(np.mean(cg > 140))
-        if bright < 0.012 or bright > 0.45:
-            continue
-        # Title text sits on a dark header.
-        if float(np.mean(cg)) > 90:
-            continue
-        score = min(1.0, bw / 280.0) * 0.5 + min(1.0, bright * 8.0) * 0.5
-        # Prefer panels offset from the cursor (left-center of this crop).
-        if x > 40:
-            score += 0.08
-        bands.append((crop, score))
-    bands.sort(key=lambda item: item[1], reverse=True)
-    return bands[:4]
+        score = 0.45 + min(0.35, bw / 400.0) + min(0.2, bright * 3.0)
+        chips.append((crop, score))
+    chips.sort(key=lambda item: item[1], reverse=True)
+    if chips:
+        return chips[:4]
+    return _fallback_text_strip(bgr, gray)
+
+
+def _fallback_text_strip(bgr: np.ndarray, gray: np.ndarray) -> list[tuple[np.ndarray, float]]:
+    """If the gray border is too thin to contour, keep the darkest strip with white glyphs."""
+    h, w = gray.shape[:2]
+    if h < 14 or w < 40:
+        return []
+    dark = gray < 40
+    bright = gray > 150
+    if float(np.mean(dark)) < 0.08 or float(np.mean(bright)) < 0.01:
+        return []
+    ys = np.where(bright.any(axis=1))[0]
+    xs = np.where(bright.any(axis=0))[0]
+    if ys.size == 0 or xs.size == 0:
+        return []
+    y0, y1 = int(ys[0]), int(ys[-1]) + 1
+    x0, x1 = int(xs[0]), int(xs[-1]) + 1
+    pad = 4
+    y0, x0 = max(0, y0 - pad), max(0, x0 - pad)
+    y1, x1 = min(h, y1 + pad), min(w, x1 + pad)
+    if y1 - y0 < 12 or x1 - x0 < 36:
+        return []
+    crop = bgr[y0:y1, x0:x1]
+    return [(crop, 0.4)]
 
 
 def _ocr_engine():
@@ -108,15 +146,22 @@ def _ocr_image(engine, bgr: np.ndarray) -> str:
     from winrt.windows.graphics.imaging import BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap
     from winrt.windows.storage.streams import DataWriter
 
-    if bgr.shape[0] < 18 or bgr.shape[1] < 40:
+    if bgr is None or bgr.size == 0:
         return ""
-    up = cv2.resize(bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    h, w = bgr.shape[:2]
+    if h < 10 or w < 24:
+        return ""
+    # Pad so OCR has margin; upscale the tiny stash chip.
+    pad = 8
+    padded = cv2.copyMakeBorder(bgr, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=(8, 8, 8))
+    scale = 3.0 if h < 36 else 2.0
+    up = cv2.resize(padded, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     bgra = np.ascontiguousarray(cv2.cvtColor(up, cv2.COLOR_BGR2BGRA))
-    h, w = bgra.shape[:2]
+    uh, uw = bgra.shape[:2]
     writer = DataWriter()
     writer.write_bytes(bgra.tobytes())
     buf = writer.detach_buffer()
-    bmp = SoftwareBitmap(BitmapPixelFormat.BGRA8, w, h, BitmapAlphaMode.IGNORE)
+    bmp = SoftwareBitmap(BitmapPixelFormat.BGRA8, uw, uh, BitmapAlphaMode.IGNORE)
     SoftwareBitmap.copy_from_buffer(bmp, buf)
 
     async def _run():
@@ -124,9 +169,10 @@ def _ocr_image(engine, bgr: np.ndarray) -> str:
         return str(result.text or "").strip()
 
     try:
-        return _run_async(_run())
+        text = _run_async(_run())
     except Exception:
         return ""
+    return " ".join(text.split())
 
 
 def _run_async(coro) -> str:

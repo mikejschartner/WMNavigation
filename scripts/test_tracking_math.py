@@ -220,6 +220,7 @@ def test_item_name_lookup():
         "sugar": ItemInfo("sugar", "Pack of sugar", "Sugar", "", 25000, 0, ""),
         "bolts": ItemInfo("bolts", "Bolts", "Bolts", "", 12000, 0, ""),
         "ak": ItemInfo("ak", "Kalashnikov AK-74M 5.45x39 assault rifle", "AK-74M", "", 40000, 0, ""),
+        "tape": ItemInfo("tape", "KEKTAPE duct tape", "KEKTAPE", "", 18000, 0, ""),
     }
     idx = ItemNameIndex(catalog)
     hit = idx.lookup("Pack of sugar")
@@ -228,42 +229,63 @@ def test_item_name_lookup():
     assert fuzzy and fuzzy[0] == "sugar"
     short = idx.lookup("AK-74M")
     assert short and short[0] == "ak"
+    tape = idx.lookup("KEKTAPE duct tape")
+    assert tape and tape[0] == "tape"
     assert idx.lookup("zzzz not an item") is None
 
 
-def test_tooltip_title_band():
+def _stash_name_chip(text: str = "KEKTAPE duct tape"):
     import cv2
     import numpy as np
 
-    from wmnavi.loot_tooltip import find_title_bands
+    img = np.full((86, 520, 3), (52, 48, 44), dtype=np.uint8)
+    tw = min(500, 22 + 11 * len(text))
+    th = 26
+    x, y = 8, 86 - th - 10
+    cv2.rectangle(img, (x, y), (x + tw, y + th), (8, 8, 8), -1)
+    cv2.rectangle(img, (x, y), (x + tw, y + th), (186, 186, 186), 1)
+    cv2.putText(
+        img,
+        text,
+        (x + 8, y + th - 7),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+    return img
 
-    img = np.zeros((360, 520, 3), dtype=np.uint8)
-    img[:] = (70, 64, 58)
-    img[50:170, 180:500] = (24, 22, 18)
-    cv2.putText(img, "Pack of sugar", (196, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (80, 210, 230), 2, cv2.LINE_AA)
-    bands = find_title_bands(img)
-    assert bands, "expected a dark tooltip title band"
-    crop, score = bands[0]
-    assert crop.shape[0] >= 20 and crop.shape[1] >= 80
+
+def test_tooltip_title_band():
+    from wmnavi.loot_tooltip import find_name_chips
+
+    img = _stash_name_chip()
+    chips = find_name_chips(img)
+    assert chips, "expected the above-right stash name chip"
+    crop, score = chips[0]
+    assert crop.shape[0] >= 12 and crop.shape[1] >= 60
     assert score > 0.2
 
 
 def test_windows_ocr_tooltip_text():
-    import cv2
-    import numpy as np
-
-    from wmnavi.loot_tooltip import _ocr_engine, _ocr_image, find_title_bands
+    from wmnavi.loot_names import ItemNameIndex
+    from wmnavi.loot_tooltip import _ocr_engine, _ocr_image, find_name_chips
+    from wmnavi.models import ItemInfo
 
     engine = _ocr_engine()
     if engine is None:
         return
-    img = np.zeros((160, 420, 3), dtype=np.uint8)
-    img[:] = (22, 20, 18)
-    cv2.putText(img, "Pack of sugar", (18, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 210, 230), 2, cv2.LINE_AA)
-    bands = find_title_bands(img)
-    crop = bands[0][0] if bands else img
-    text = _ocr_image(engine, crop)
-    assert "sugar" in text.lower()
+    img = _stash_name_chip("KEKTAPE duct tape")
+    chips = find_name_chips(img)
+    crop = chips[0][0] if chips else img
+    text = _ocr_image(engine, crop) or _ocr_image(engine, img)
+    assert text, "OCR returned empty on a high-contrast name chip"
+    idx = ItemNameIndex(
+        {"tape": ItemInfo("tape", "KEKTAPE duct tape", "KEKTAPE", "", 18000, 0, "")}
+    )
+    hit = idx.lookup(text)
+    assert hit and hit[0] == "tape", text
 
 
 def main() -> int:
