@@ -63,6 +63,10 @@ def main() -> int:
             raise RuntimeError("map graphic missing after MainWindow load")
         if not hasattr(window, "btn_loot_value"):
             raise RuntimeError("Loot Value button missing")
+        if hasattr(window, "btn_ai_prediction") or hasattr(window, "btn_audio_indicator"):
+            raise RuntimeError("AI Prediction / Audio Indicator should be removed")
+        if window.splitter.childrenCollapsible():
+            raise RuntimeError("sidebar splitter must not be collapsible")
         rect = mv.scene.sceneRect()
         if rect.width() < 40 or rect.height() < 40:
             raise RuntimeError(f"map scene empty: {rect}")

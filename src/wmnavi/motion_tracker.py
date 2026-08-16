@@ -1,7 +1,7 @@
-"""Shared lightweight visual motion tracker (compass + AI Prediction).
+"""Shared lightweight visual motion tracker (compass).
 
-Captures Tarkov frames in memory and estimates yaw/translation flow with
-Farneback optical flow. Does not run the screenshot localization pipeline.
+Captures Tarkov frames in memory and estimates yaw flow with Farneback
+optical flow. Does not run the screenshot localization pipeline.
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ class MotionTracker(QObject):
             time.sleep(0.25)
             return None
         t0 = time.perf_counter()
-        frame = capture_eft_bgr(360)
+        frame = capture_eft_bgr(280)
         if frame is None:
             time.sleep(0.08)
             return None
@@ -128,12 +128,5 @@ class MotionTracker(QObject):
             if std_fx > 6.0:
                 conf *= 0.55
         yaw_flow = float(np.median(fx))
-        rot = np.median(fx)
-        residual_x = fx - rot
-        ch, cw = gray.shape
-        lower = fy[int(ch * 0.45) :, :]
-        fwd_flow = float(np.median(lower))
-        turning = abs(yaw_flow) > 0.45
-        strafe_flow = 0.0 if turning else float(np.median(residual_x))
         ms = (time.perf_counter() - t0) * 1000
-        return gray, MotionSample(dt, yaw_flow, fwd_flow, strafe_flow, conf, True, ms)
+        return gray, MotionSample(dt, yaw_flow, 0.0, 0.0, conf, True, ms)

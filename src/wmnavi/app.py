@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -36,8 +35,6 @@ from watchdog.observers import Observer
 
 from . import __version__
 from .assets import cache_remote_file
-from .audio_hud import AudioIndicatorHud
-from .audio_service import AudioShotService
 from .loot_service import LootValueService
 from .compass import CompassHud
 from .coords import PlayerState
@@ -69,7 +66,6 @@ from .minimap import MiniMapWindow
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
 from .motion_tracker import MotionTracker
 from .paths import app_root, cache_dir
-from .predictor import MovementPredictor
 from .quest_loader import QuestInfo, load_quests_for_map, load_quests_split
 from .quest_log_sync import (
     QuestEvent,
@@ -82,7 +78,9 @@ from .quest_log_sync import (
 from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
 from .theme import STYLESHEET
-from .win_input import eft_is_foreground, movement_keys, press_v_in_raid
+from .win_input import press_v_in_raid
+
+COMPASS_YAW_DEG_PER_PX = 0.42
 
 
 class ScreenshotHandler(FileSystemEventHandler):
@@ -127,10 +125,14 @@ class Bridge(QObject):
 
 
 class MainWindow(QMainWindow):
+    update_status = Signal(str)
+    update_ready = Signal(str)
+    update_failed = Signal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"WMNavigation v{__version__}")
-        self.setMinimumSize(480, 320)
+        self.setMinimumSize(720, 420)
         icon_path = app_root() / "assets" / "icon.png"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
@@ -198,24 +200,9 @@ class MainWindow(QMainWindow):
         self._screenshot_loop_on = True
         self.heading = HeadingTracker()
         self.compass = None
-        self.predictor = MovementPredictor()
         self.motion = MotionTracker(self)
         self.motion.sample.connect(self._on_motion_sample)
-        self._ai_prediction_on = False
-        self._prediction_tick_t = 0.0
-        self._prediction_timer = QTimer(self)
-        self._prediction_timer.setInterval(50)
-        self._prediction_timer.timeout.connect(self._on_prediction_tick)
-        self._audio_indicator_on = False
         self._tracking_debug = False
-        self.audio = AudioShotService(self)
-        self.audio.set_heading_provider(self._audio_game_yaw)
-        self.audio.set_motion_provider(self._audio_motion)
-        self.audio.shot.connect(self._on_audio_shot)
-        self.audio.failed.connect(self._on_audio_failed)
-        self.audio.started.connect(self._on_audio_started)
-        self.audio_hud = AudioIndicatorHud(self.heading, self.audio.manager)
-        self.audio_hud.debug_fn = lambda: self.audio.debug
         self.loot = LootValueService(self)
         self.loot.updated.connect(self._on_loot_updated)
         self._loot_value_on = False
@@ -247,8 +234,9 @@ class MainWindow(QMainWindow):
             self.start_watchers()
         except Exception:
             pass
-        if self.settings.value("ai_prediction", True, type=bool):
-            self.btn_ai_prediction.setChecked(True)
+        self.update_status.connect(self._on_update_status)
+        self.update_ready.connect(self._on_update_ready)
+        self.update_failed.connect(self._on_update_failed)
         self._friend_prune_timer.start()
         QTimer.singleShot(300, self._start_global_hotkeys)
 
@@ -282,8 +270,9 @@ class MainWindow(QMainWindow):
 
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(180)
+        sidebar.setMinimumWidth(240)
         sidebar.setMaximumWidth(520)
+        self.sidebar = sidebar
         side_layout = QVBoxLayout(sidebar)
         side_layout.setContentsMargins(12, 10, 12, 10)
         side_layout.setSpacing(6)
@@ -472,7 +461,7 @@ class MainWindow(QMainWindow):
         self._update_minimap_zoom_label()
 
         self.chk_tracking_debug = QCheckBox("Tracking debug")
-        self.chk_tracking_debug.setToolTip("Show confirmed vs predicted tracking numbers (not for normal raids).")
+        self.chk_tracking_debug.setToolTip("Show compass motion and loot-match numbers (not for normal raids).")
         self.chk_tracking_debug.toggled.connect(self.on_tracking_debug_toggled)
         bottom_layout.addWidget(self.chk_tracking_debug)
 
@@ -590,25 +579,6 @@ class MainWindow(QMainWindow):
         self.btn_loot_route.clicked.connect(lambda: self.start_route("loot"))
         top_row.addWidget(self.btn_loot_route)
         top_row.addStretch(1)
-        self.btn_ai_prediction = QPushButton("AI Prediction")
-        self.btn_ai_prediction.setCheckable(True)
-        self.btn_ai_prediction.setToolTip(
-            "On by default: estimate movement between V pings from walk/run keys and look.\n"
-            "W walks, Shift+W sprints, A/D strafe, S backpedals, stand still stays put.\n"
-            "V screenshot is still the true position. Right-click to reset calibration."
-        )
-        self.btn_ai_prediction.toggled.connect(self.on_ai_prediction_toggled)
-        self.btn_ai_prediction.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.btn_ai_prediction.customContextMenuRequested.connect(self._ai_prediction_menu)
-        top_row.addWidget(self.btn_ai_prediction)
-        self.btn_audio_indicator = QPushButton("Audio Indicator")
-        self.btn_audio_indicator.setCheckable(True)
-        self.btn_audio_indicator.setToolTip(
-            "Listen to game output for gunshots (including distant ones) and show direction on screen.\n"
-            "Does not mute or reroute Tarkov audio. Independent of Compass and AI Prediction."
-        )
-        self.btn_audio_indicator.toggled.connect(self.on_audio_indicator_toggled)
-        top_row.addWidget(self.btn_audio_indicator)
         self.btn_loot_value = QPushButton("Loot Value")
         self.btn_loot_value.setCheckable(True)
         self.btn_loot_value.setToolTip(
@@ -637,15 +607,20 @@ class MainWindow(QMainWindow):
         splitter.addWidget(map_host)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setChildrenCollapsible(True)
-        splitter.setSizes([280, 1100])
+        splitter.setChildrenCollapsible(False)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setSizes([300, 1100])
+        self.splitter = splitter
+        splitter.splitterMoved.connect(self._keep_sidebar_open)
+        QTimer.singleShot(0, self._keep_sidebar_open)
 
         self._set_mode_combo(self.current_game_mode)
         self.on_topmost()
         self._sync_live_timer()
         self._select_map_combo(self.current_map_slug)
         self._update_price_labels()
-        QTimer.singleShot(2500, self.check_for_updates)
+        QTimer.singleShot(800, self.check_for_updates)
 
     def _update_marker_scale_label(self):
         scale = self.marker_scale_slider.value() / 100.0
@@ -679,55 +654,62 @@ class MainWindow(QMainWindow):
         if self._minimap_ok():
             self.minimap.map_view.set_marker_scale(scale)
 
+    def _keep_sidebar_open(self, *_args):
+        if not hasattr(self, "splitter"):
+            return
+        sizes = self.splitter.sizes()
+        if len(sizes) < 2:
+            return
+        if sizes[0] >= 240:
+            return
+        total = sum(sizes) or 1400
+        self.splitter.setSizes([300, max(400, total - 300)])
+
     def check_for_updates(self):
         if not self.settings.value("auto_update_check", True, type=bool):
             return
         self.status_label.setText("Checking for updates…")
+        threading.Thread(target=self._update_worker, daemon=True, name="wmnavi-update").start()
+
+    def _update_worker(self):
         try:
             from .paths import is_frozen
             from .updater import apply_update, check_for_update
 
             info = check_for_update()
-        except Exception:
-            self.status_label.setText("Ready")
-            return
-        if not info:
-            self.status_label.setText(f"Up to date (v{__version__})")
-            QTimer.singleShot(4000, lambda: self.status_label.setText("Ready"))
-            return
-
-        remote = info["version"]
-        notes = (info.get("releaseNotes") or "").strip()
-        msg = (
-            f"WMNavigation {remote} is available "
-            f"(you have {__version__}).\n\n"
-            "The app will close and reopen on the new version."
-        )
-        if notes:
-            msg += f"\n\n{notes[:400]}"
-        # Frozen builds used to download+quit with no dialog, which looks like a crash
-        # when OneDrive locks the exe and the restart never happens.
-        auto_apply = is_frozen()
-        if not auto_apply:
-            reply = QMessageBox.question(
-                self,
-                "Update available",
-                msg + "\n\nUpdate now?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                self.status_label.setText("Ready")
+            if not info:
+                self.update_status.emit(f"Up to date (v{__version__})")
                 return
-        else:
-            QMessageBox.information(self, "Updating", msg)
-
-        self.status_label.setText(f"Updating to v{remote}…")
-        try:
-            apply_update(info["downloadUrl"])
-            QTimer.singleShot(400, QApplication.instance().quit)
+            remote = str(info["version"])
+            if not is_frozen():
+                self.update_status.emit(f"Update v{remote} available (dev build — skipped)")
+                return
+            self.update_status.emit(f"Downloading v{remote}…")
+            apply_update(
+                info["downloadUrl"],
+                on_progress=lambda text: self.update_status.emit(text),
+            )
+            self.update_ready.emit(remote)
         except Exception as exc:
-            self.status_label.setText("Update failed")
-            QMessageBox.warning(self, "Update failed", str(exc))
+            self.update_failed.emit(str(exc))
+
+    def _on_update_status(self, text: str):
+        self.status_label.setText(text)
+        if text.startswith("Up to date") or "skipped" in text:
+            QTimer.singleShot(3500, self._clear_update_status)
+
+    def _clear_update_status(self):
+        text = self.status_label.text()
+        if text.startswith("Up to date") or "skipped" in text or text.startswith("Checking for updates"):
+            self.status_label.setText("Ready")
+
+    def _on_update_ready(self, remote: str):
+        self.status_label.setText(f"Restarting to apply v{remote}…")
+        QTimer.singleShot(400, QApplication.instance().quit)
+
+    def _on_update_failed(self, err: str):
+        self.status_label.setText(f"Update failed — keep using v{__version__}")
+        QTimer.singleShot(8000, lambda: self.status_label.setText("Ready") if "Update failed" in self.status_label.text() else None)
 
     def _set_mode_combo(self, mode_key: str):
         for label, key in GAME_MODES.items():
@@ -1433,14 +1415,6 @@ class MainWindow(QMainWindow):
             z=state.z,
             transform=self.map_view.map_transform,
         )
-        self.predictor.confirm(
-            state,
-            map_slug=self.current_map_slug,
-            loc_ms=self._last_loc_ms,
-            bounds=self.map_view.map_bounds,
-            rotation=self.map_view.map_rotation,
-            transform=self.map_view.map_transform,
-        )
         self._select_floor_for_y(state.y)
         self._apply_live_marker()
         self.map_view.center_on_player()
@@ -1718,17 +1692,11 @@ class MainWindow(QMainWindow):
             pass
         self._screenshot_poll.stop()
         self._live_timer.stop()
-        self._prediction_timer.stop()
         self._friend_prune_timer.stop()
         self._route_refresh_timer.stop()
         try:
             if self.compass is not None:
                 self.compass.shutdown()
-        except Exception:
-            pass
-        try:
-            self.audio.stop()
-            self.audio_hud.shutdown()
         except Exception:
             pass
         try:
@@ -1904,7 +1872,6 @@ class MainWindow(QMainWindow):
             )
             self.compass.set_player_xz(self._last_player.x, self._last_player.z)
         visible = self.compass.toggle()
-        self.audio_hud.set_compass_visible(visible)
         self._sync_motion_tracker()
         if visible:
             self.status_label.setText("Compass on (F9)")
@@ -1915,72 +1882,10 @@ class MainWindow(QMainWindow):
         return self.compass is not None and self.compass.isVisible()
 
     def _sync_motion_tracker(self):
-        need = self._compass_on() or self._ai_prediction_on
-        if need:
+        if self._compass_on():
             self.motion.start()
         else:
             self.motion.stop()
-        if self._ai_prediction_on:
-            self._prediction_tick_t = 0.0
-            self._prediction_timer.start()
-        else:
-            self._prediction_timer.stop()
-
-    def on_ai_prediction_toggled(self, on: bool):
-        self._ai_prediction_on = bool(on)
-        self.settings.setValue("ai_prediction", self._ai_prediction_on)
-        self._sync_motion_tracker()
-        if not on:
-            self.map_view.set_confirmed_ghost(None)
-            if self._last_player:
-                self.map_view.set_player(self._last_player)
-            self.status_label.setText("AI Prediction off")
-        else:
-            self.status_label.setText("AI Prediction on · walk/run between V pings")
-            self._apply_live_marker()
-        self._update_tracking_debug()
-
-    def _prediction_keys(self) -> dict:
-        if self.in_raid and eft_is_foreground():
-            return movement_keys()
-        return {}
-
-    def _keys_moving(self, keys: dict | None = None) -> bool:
-        keys = keys if keys is not None else self._prediction_keys()
-        return bool(keys.get("forward") or keys.get("back") or keys.get("left") or keys.get("right"))
-
-    def _on_prediction_tick(self):
-        if not self._ai_prediction_on or not self.predictor.state.has_fix:
-            return
-        now = time.perf_counter()
-        dt = 0.05 if not self._prediction_tick_t else now - self._prediction_tick_t
-        self._prediction_tick_t = now
-        yaw = self.heading.game_yaw if self.heading.has_heading else self.predictor.state.predicted_yaw
-        self.predictor.apply_controls(
-            dt,
-            self._prediction_keys(),
-            yaw,
-            bounds=self.map_view.map_bounds,
-            rotation=self.map_view.map_rotation,
-            transform=self.map_view.map_transform,
-        )
-        self._apply_live_marker()
-        live = self._live_player_state()
-        if live and self.compass is not None:
-            self.compass.set_player_xz(live.x, live.z)
-        if live:
-            self.heading.set_player_xz(live.x, live.z)
-
-    def _audio_game_yaw(self):
-        if self.heading.has_heading:
-            return float(self.heading.game_yaw)
-        return None
-
-    def _audio_motion(self):
-        keys = movement_keys()
-        keys_moving = self._keys_moving(keys)
-        speed = float(self.predictor.state.speed or 0.0) if self.predictor.state.has_fix else 0.0
-        return {"speed": speed, "keys_moving": keys_moving}
 
     def on_loot_value_toggled(self, on: bool):
         self._loot_value_on = bool(on)
@@ -2004,155 +1909,50 @@ class MainWindow(QMainWindow):
         if self._tracking_debug:
             self._update_tracking_debug()
 
-    def on_audio_indicator_toggled(self, on: bool):
-        self._audio_indicator_on = bool(on)
-        self.audio_hud.debug = self._tracking_debug
-        self.audio_hud.set_compass_visible(self._compass_on())
-        if on:
-            self.audio.start()
-            if self.audio.active:
-                self.status_label.setText("Audio Indicator on · listening to game output")
-                if self._tracking_debug:
-                    self.audio_hud.note_shot()
-            else:
-                self.btn_audio_indicator.blockSignals(True)
-                self.btn_audio_indicator.setChecked(False)
-                self.btn_audio_indicator.blockSignals(False)
-                self._audio_indicator_on = False
-                self.audio_hud.shutdown()
-        else:
-            self.audio.stop()
-            self.audio_hud.shutdown()
-            self.status_label.setText("Audio Indicator off")
-        self._update_tracking_debug()
-
-    @Slot(object)
-    def _on_audio_shot(self, _event):
-        if not self._audio_indicator_on:
-            return
-        self.audio_hud.debug_snapshot = self.audio.debug
-        self.audio_hud.set_compass_visible(self._compass_on())
-        self.audio_hud.note_shot()
-        self._update_tracking_debug()
-
-    def _on_audio_failed(self, err: str):
-        self.status_label.setText(f"Audio Indicator: {err}")
-        self._update_tracking_debug()
-
-    def _on_audio_started(self, info):
-        name = getattr(info, "device_name", "") or "WASAPI loopback"
-        self.status_label.setText(f"Audio Indicator on · {name}")
-        self._update_tracking_debug()
-
-    def _ai_prediction_menu(self, pos):
-        menu = QMenu(self)
-        act = menu.addAction("Reset prediction calibration")
-        chosen = menu.exec(self.btn_ai_prediction.mapToGlobal(pos))
-        if chosen == act:
-            self.predictor.reset_calibration()
-            self.status_label.setText("Prediction calibration reset")
-            self._update_tracking_debug()
-
     def on_tracking_debug_toggled(self, on: bool):
         self._tracking_debug = bool(on)
         self.tracking_debug_label.setVisible(self._tracking_debug)
-        self.audio_hud.debug = self._tracking_debug
         self.loot.set_debug(self._tracking_debug)
-        if self._tracking_debug and self._audio_indicator_on:
-            self.audio_hud.note_shot()
         self._apply_live_marker()
         self._update_tracking_debug()
 
     def _live_player_state(self) -> PlayerState | None:
-        if self._ai_prediction_on:
-            return self.predictor.predicted_player() or self._last_player
         return self._last_player
 
     def _apply_live_marker(self):
         live = self._live_player_state()
         if live:
             self.map_view.set_player(live)
-        confirmed = self.predictor.confirmed_player() if self.predictor.state.has_fix else self._last_player
-        show_ghost = self._tracking_debug and self._ai_prediction_on
-        self.map_view.set_confirmed_ghost(confirmed, visible=show_ghost)
+        self.map_view.set_confirmed_ghost(None)
         if self._minimap_ok() and self.minimap.isVisible() and live:
             self.minimap.map_view.set_player(live)
             self._refocus_minimap_view(self.minimap.map_view)
 
     @Slot(object)
     def _on_motion_sample(self, sample):
-        if not (self._compass_on() or self._ai_prediction_on):
+        if not self._compass_on():
             return
-        yaw_delta = -float(getattr(sample, "yaw_flow_px", 0.0)) * self.predictor.calib.yaw_deg_per_px
+        yaw_delta = -float(getattr(sample, "yaw_flow_px", 0.0)) * COMPASS_YAW_DEG_PER_PX
         self.heading.apply_visual_yaw(yaw_delta, float(getattr(sample, "feature_conf", 0.0)))
-        self.predictor.apply_motion(
-            sample,
-            prediction_on=self._ai_prediction_on,
-            bounds=self.map_view.map_bounds,
-            rotation=self.map_view.map_rotation,
-            transform=self.map_view.map_transform,
-            skip_translation=self._ai_prediction_on and self._keys_moving(),
-        )
-        if self.predictor.state.has_fix:
-            self.predictor.state.predicted_yaw = self.heading.game_yaw
-        if self._ai_prediction_on:
-            self._apply_live_marker()
-            live = self._live_player_state()
-            if live and self.compass is not None:
-                self.compass.set_player_xz(live.x, live.z)
-            if live:
-                self.heading.set_player_xz(live.x, live.z)
+        if self._last_player:
+            if self.compass is not None:
+                self.compass.set_player_xz(self._last_player.x, self._last_player.z)
+            self.heading.set_player_xz(self._last_player.x, self._last_player.z)
         self._update_tracking_debug()
 
     def _update_tracking_debug(self):
         if not self._tracking_debug:
             return
-        st = self.predictor.state
-        cal = self.predictor.calib
         motion = self.motion.last_sample
-        conf_line = (
-            f"CONF {st.confirmed_x:.1f},{st.confirmed_z:.1f}  yaw {st.confirmed_yaw:.0f}°"
-            if st.has_fix
-            else "CONF —"
-        )
-        pred_line = (
-            f"PRED {st.predicted_x:.1f},{st.predicted_z:.1f}  yaw {st.predicted_yaw:.0f}°"
-            if st.has_fix
-            else "PRED —"
-        )
         flow = "no frame"
         if motion is not None:
             flow = (
-                f"flow yaw {motion.yaw_flow_px:.2f} fwd {motion.fwd_flow_px:.2f} "
-                f"strafe {motion.strafe_flow_px:.2f} vis {motion.feature_conf:.2f} "
+                f"flow yaw {motion.yaw_flow_px:.2f} vis {motion.feature_conf:.2f} "
                 f"{motion.process_ms:.0f}ms cap={'ok' if motion.capture_ok else 'fail'}"
             )
+        heading = f"yaw {self.heading.game_yaw:.0f}°" if self.heading.has_heading else "yaw —"
         self.tracking_debug_label.setText(
-            f"{conf_line} · {pred_line} · spd {st.speed:.1f}m/s · "
-            f"conf {st.confidence:.2f} · err {st.last_error_m:.1f}m · "
-            f"{cal.state_name()} n={cal.samples} · t+{self.predictor.time_since_confirm():.1f}s · "
-            f"loc {st.loc_ms:.1f}ms · {self.motion.fps:.0f} Hz · {flow} · {self._audio_debug_line()} · {self._loot_debug_line()}"
-        )
-
-    def _audio_debug_line(self) -> str:
-        cap = self.audio.capture
-        dbg = self.audio.debug
-        yaw = self._audio_game_yaw()
-        yaw_s = f"{yaw:.0f}°" if yaw is not None else "—"
-        events = self.audio.manager.events
-        ev_s = ",".join(
-            f"{e.rel_deg:+.0f}°x{e.count}" + (f"@{e.world_bearing:.0f}" if e.world_bearing is not None else "")
-            for e in events
-        ) or "none"
-        if not cap.ok and not self._audio_indicator_on:
-            return "AUD off"
-        status = "ok" if cap.ok and self.audio.active else (cap.error or "idle")
-        return (
-            f"AUD {status} {cap.device_name[:28]} "
-            f"L {dbg.rms_l:.3f} R {dbg.rms_r:.3f} "
-            f"p {dbg.gunshot_prob:.2f} f {dbg.footstep_prob:.2f} self {dbg.self_footstep_prob:.2f} "
-            f"{dbg.kind} {dbg.rel_deg:+.0f}° dconf {dbg.dir_conf:.2f} aconf {dbg.angle_conf:.2f} "
-            f"yaw {yaw_s} lat {self.audio.last_latency_ms:.0f}ms ev [{ev_s}]"
+            f"{heading} · {self.motion.fps:.0f} Hz · {flow} · {self._loot_debug_line()}"
         )
 
     def _loot_debug_line(self) -> str:
@@ -2449,7 +2249,7 @@ def run():
         app.setApplicationName("WMNavigation")
         window = MainWindow()
         window.resize(1400, 900)
-        window.setMinimumSize(480, 320)
+        window.setMinimumSize(720, 420)
         window.show()
         sys.exit(app.exec())
     except Exception:

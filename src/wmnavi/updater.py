@@ -10,7 +10,7 @@ from pathlib import Path
 import requests
 
 from . import __version__
-from .paths import is_frozen
+from .paths import is_frozen, user_data_dir
 
 GITHUB_OWNER = "mikejschartner"
 GITHUB_REPO = "WMNavigation"
@@ -75,7 +75,7 @@ def _fetch_releases_api(timeout: float) -> dict | None:
         return None
 
 
-def check_for_update(timeout: float = 8.0) -> dict | None:
+def check_for_update(timeout: float = 6.0) -> dict | None:
     """Return update info if a newer GitHub release exists.
 
     Prefers latest.json when present; if missing or incomplete, uses the
@@ -111,52 +111,73 @@ def check_for_update(timeout: float = 8.0) -> dict | None:
     }
 
 
-def apply_update(download_url: str) -> Path | None:
-    """Download the new exe next to the running app, then replace+restart after exit."""
+def apply_update(download_url: str, on_progress=None) -> Path | None:
+    """Download the new exe to LocalAppData, then replace+restart after exit.
+
+    Staging off OneDrive/Desktop avoids file locks that made updates hang or
+    look like crashes. Copy retries then fall back to launching the staged copy.
+    """
     if is_frozen():
         target = Path(sys.executable).resolve()
     else:
         target = Path.cwd() / "WMNavigation.exe"
 
-    dest_dir = target.parent
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    staged = dest_dir / "WMNavigation_new.exe"
+    update_dir = user_data_dir() / "update"
+    update_dir.mkdir(parents=True, exist_ok=True)
+    staged = update_dir / "WMNavigation.exe"
+
+    if on_progress:
+        on_progress("Downloading update…")
 
     headers = {"User-Agent": f"WMNavigation/{__version__}"}
-    resp = requests.get(download_url, timeout=120, headers=headers, stream=True)
+    resp = requests.get(download_url, timeout=(20, 180), headers=headers, stream=True)
     resp.raise_for_status()
+    total = int(resp.headers.get("Content-Length") or 0)
+    got = 0
+    last_pct = -1
     with staged.open("wb") as fh:
-        for chunk in resp.iter_content(chunk_size=1024 * 256):
-            if chunk:
-                fh.write(chunk)
+        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+            if not chunk:
+                continue
+            fh.write(chunk)
+            got += len(chunk)
+            if on_progress and total:
+                pct = min(99, got * 100 // total)
+                if pct != last_pct:
+                    last_pct = pct
+                    on_progress(f"Downloading update… {pct}%")
 
     if staged.stat().st_size < 1_000_000:
         staged.unlink(missing_ok=True)
         raise RuntimeError("Downloaded update looks too small")
 
-    bat = dest_dir / "wmnavi_apply_update.bat"
+    if on_progress:
+        on_progress("Download complete · restarting…")
+
+    bat = update_dir / "wmnavi_apply_update.bat"
     pid = os.getpid()
     bat.write_text(
         "\r\n".join(
             [
                 "@echo off",
-                "setlocal",
+                "setlocal EnableExtensions",
                 f'set "TARGET={target}"',
                 f'set "STAGED={staged}"',
-                "timeout /t 2 /nobreak >nul",
+                "ping -n 3 127.0.0.1 >nul",
                 ":wait",
                 f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul',
                 "if not errorlevel 1 (",
-                "  timeout /t 1 /nobreak >nul",
+                "  ping -n 2 127.0.0.1 >nul",
                 "  goto wait",
                 ")",
+                'attrib -R "%TARGET%" >nul 2>&1',
                 "set /a N=0",
                 ":retry",
                 "set /a N+=1",
                 'copy /Y "%STAGED%" "%TARGET%" >nul 2>&1',
                 "if not errorlevel 1 goto launch_target",
-                "if %N% LSS 15 (",
-                "  timeout /t 1 /nobreak >nul",
+                "if %N% LSS 40 (",
+                "  ping -n 2 127.0.0.1 >nul",
                 "  goto retry",
                 ")",
                 'start "" "%STAGED%"',
@@ -171,11 +192,13 @@ def apply_update(download_url: str) -> Path | None:
         ),
         encoding="utf-8",
     )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
+        subprocess, "DETACHED_PROCESS", 0
+    )
     subprocess.Popen(
         ["cmd", "/c", str(bat)],
-        cwd=str(dest_dir),
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        | getattr(subprocess, "DETACHED_PROCESS", 0),
+        cwd=str(update_dir),
+        creationflags=flags,
         close_fds=True,
     )
     return bat
