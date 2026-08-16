@@ -27,6 +27,9 @@ LOW_CONFIDENCE = "LOW_CONFIDENCE"
 WALK_MPS = 3.0
 SPRINT_MPS = 6.2
 MAX_MPS = 8.5
+CROUCH_MPS = 1.55
+BACKPEDAL_MPS = 2.1
+STRAFE_WALK_MPS = 2.4
 
 
 def _profile_path() -> Path:
@@ -181,7 +184,90 @@ class MovementPredictor:
         self._integ_dt = 0.0
         self._clamp_bounds(bounds, rotation, transform)
 
-    def apply_motion(self, sample: MotionSample, *, prediction_on: bool, bounds=None, rotation=0, transform=None):
+    def apply_controls(
+        self,
+        dt: float,
+        keys: dict,
+        yaw_deg: float,
+        *,
+        bounds=None,
+        rotation=0,
+        transform=None,
+    ):
+        """Dead-reckon from WASD along current facing. V pings remain ground truth."""
+        if not self.state.has_fix:
+            return
+        dt = max(0.008, min(0.12, float(dt)))
+        self.state.predicted_yaw = wrap_deg(float(yaw_deg))
+        yaw = math.radians(self.state.predicted_yaw)
+        fwd_x, fwd_z = math.sin(yaw), math.cos(yaw)
+        right_x, right_z = math.cos(yaw), -math.sin(yaw)
+
+        ax = 0.0
+        ay = 0.0
+        if keys.get("forward"):
+            ax += 1.0
+        if keys.get("back"):
+            ax -= 1.0
+        if keys.get("right"):
+            ay += 1.0
+        if keys.get("left"):
+            ay -= 1.0
+        mag = math.hypot(ax, ay)
+        if mag > 1.0:
+            ax /= mag
+            ay /= mag
+
+        if mag < 0.1:
+            self.state.vx *= 0.12
+            self.state.vz *= 0.12
+            if math.hypot(self.state.vx, self.state.vz) < 0.12:
+                self.state.vx = 0.0
+                self.state.vz = 0.0
+                self.state.speed = 0.0
+                return
+            self.state.speed = math.hypot(self.state.vx, self.state.vz)
+            self.state.predicted_x += self.state.vx * dt
+            self.state.predicted_z += self.state.vz * dt
+            self._clamp_bounds(bounds, rotation, transform)
+            return
+
+        sprint = bool(keys.get("sprint")) and ax > 0.3 and not keys.get("crouch")
+        if keys.get("crouch"):
+            speed = CROUCH_MPS
+        elif sprint:
+            speed = SPRINT_MPS
+        elif ax < -0.3 and abs(ay) < 0.3:
+            speed = BACKPEDAL_MPS
+        elif abs(ay) >= abs(ax) and ax <= 0.3:
+            speed = STRAFE_WALK_MPS
+        else:
+            speed = WALK_MPS
+
+        vx = (fwd_x * ax + right_x * ay) * speed
+        vz = (fwd_z * ax + right_z * ay) * speed
+        cap = math.hypot(vx, vz)
+        if cap > MAX_MPS:
+            scale = MAX_MPS / cap
+            vx *= scale
+            vz *= scale
+        self.state.vx = vx
+        self.state.vz = vz
+        self.state.speed = math.hypot(vx, vz)
+        self.state.predicted_x += vx * dt
+        self.state.predicted_z += vz * dt
+        self._clamp_bounds(bounds, rotation, transform)
+
+    def apply_motion(
+        self,
+        sample: MotionSample,
+        *,
+        prediction_on: bool,
+        bounds=None,
+        rotation=0,
+        transform=None,
+        skip_translation: bool = False,
+    ):
         if not self.state.has_fix:
             return
         dt = max(0.01, min(0.12, float(sample.dt or 0.05)))
@@ -196,6 +282,9 @@ class MovementPredictor:
 
         if not prediction_on:
             self.state.speed = 0.0
+            return
+
+        if skip_translation:
             return
 
         if conf < 0.10 or not sample.capture_ok:

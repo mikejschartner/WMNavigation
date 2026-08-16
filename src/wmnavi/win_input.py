@@ -89,7 +89,7 @@ VK_LCONTROL = 0xA2
 
 
 def movement_keys() -> dict[str, bool]:
-    """True if the key is down. Used for loot-idle and audio self-step."""
+    """True if the key is down. Used for loot-idle, audio self-step, and prediction."""
     def down(vk: int) -> bool:
         return bool(user32.GetAsyncKeyState(vk) & 0x8000)
 
@@ -99,8 +99,15 @@ def movement_keys() -> dict[str, bool]:
         "left": down(VK_A),
         "right": down(VK_D),
         "sprint": down(VK_SHIFT),
-        "crouch": down(VK_C),
+        "crouch": down(VK_C) or down(VK_LCONTROL),
     }
+
+
+def eft_is_foreground() -> bool:
+    hwnd = find_eft_window()
+    if not hwnd:
+        return False
+    return int(user32.GetForegroundWindow() or 0) == hwnd
 
 
 def find_eft_window() -> int | None:

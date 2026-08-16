@@ -71,6 +71,45 @@ def test_predictor_coasts_when_flow_drops():
     assert abs(p.state.predicted_z) >= abs(z_after) * 0.5
 
 
+def test_predictor_keys_walk_and_sprint():
+    p = MovementPredictor()
+    p.reset_calibration()
+    p.confirm(PlayerState(0, 1, 0, 0), map_slug="customs")
+    walk = {"forward": True, "back": False, "left": False, "right": False, "sprint": False, "crouch": False}
+    p.apply_controls(0.1, walk, 0.0)
+    walk_z = p.state.predicted_z
+    assert walk_z > 0.25
+    assert abs(p.state.predicted_x) < 0.05
+    p2 = MovementPredictor()
+    p2.reset_calibration()
+    p2.confirm(PlayerState(0, 1, 0, 0), map_slug="customs")
+    sprint = dict(walk, sprint=True)
+    p2.apply_controls(0.1, sprint, 0.0)
+    assert p2.state.predicted_z > walk_z * 1.5
+
+
+def test_predictor_keys_idle_stops():
+    p = MovementPredictor()
+    p.reset_calibration()
+    p.confirm(PlayerState(0, 1, 0, 0), map_slug="customs")
+    walk = {"forward": True, "back": False, "left": False, "right": False, "sprint": False, "crouch": False}
+    p.apply_controls(0.1, walk, 0.0)
+    idle = {"forward": False, "back": False, "left": False, "right": False, "sprint": False, "crouch": False}
+    for _ in range(4):
+        p.apply_controls(0.05, idle, 0.0)
+    assert p.state.speed < 0.2
+
+
+def test_apply_motion_skip_translation():
+    p = MovementPredictor()
+    p.reset_calibration()
+    p.confirm(PlayerState(10, 1, 20, 0), map_slug="customs")
+    sample = MotionSample(0.05, 0.0, 2.0, 0.0, 0.8, True, 4.0)
+    p.apply_motion(sample, prediction_on=True, skip_translation=True)
+    assert abs(p.state.predicted_z - 20.0) < 1e-9
+    assert abs(p.state.predicted_x - 10.0) < 1e-9
+
+
 def test_blend():
     assert abs(_blend(1.0, 2.0, 0.5) - 1.5) < 1e-9
 
@@ -178,6 +217,9 @@ def main() -> int:
     test_large_heading_error_snaps()
     test_predictor_confirm_and_motion()
     test_predictor_coasts_when_flow_drops()
+    test_predictor_keys_walk_and_sprint()
+    test_predictor_keys_idle_stops()
+    test_apply_motion_skip_translation()
     test_blend()
     test_audio_ild_right_positive()
     test_audio_classes()

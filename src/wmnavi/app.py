@@ -82,7 +82,7 @@ from .quest_log_sync import (
 from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
 from .theme import STYLESHEET
-from .win_input import movement_keys, press_v_in_raid
+from .win_input import eft_is_foreground, movement_keys, press_v_in_raid
 
 
 class ScreenshotHandler(FileSystemEventHandler):
@@ -202,6 +202,10 @@ class MainWindow(QMainWindow):
         self.motion = MotionTracker(self)
         self.motion.sample.connect(self._on_motion_sample)
         self._ai_prediction_on = False
+        self._prediction_tick_t = 0.0
+        self._prediction_timer = QTimer(self)
+        self._prediction_timer.setInterval(50)
+        self._prediction_timer.timeout.connect(self._on_prediction_tick)
         self._audio_indicator_on = False
         self._tracking_debug = False
         self.audio = AudioShotService(self)
@@ -589,8 +593,9 @@ class MainWindow(QMainWindow):
         self.btn_ai_prediction = QPushButton("AI Prediction")
         self.btn_ai_prediction.setCheckable(True)
         self.btn_ai_prediction.setToolTip(
-            "On by default: estimate movement between V pings from the Tarkov view.\n"
-            "Keeps the map marker and compass turning in real time. Right-click to reset calibration."
+            "On by default: estimate movement between V pings from walk/run keys and look.\n"
+            "W walks, Shift+W sprints, A/D strafe, S backpedals, stand still stays put.\n"
+            "V screenshot is still the true position. Right-click to reset calibration."
         )
         self.btn_ai_prediction.toggled.connect(self.on_ai_prediction_toggled)
         self.btn_ai_prediction.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1713,6 +1718,7 @@ class MainWindow(QMainWindow):
             pass
         self._screenshot_poll.stop()
         self._live_timer.stop()
+        self._prediction_timer.stop()
         self._friend_prune_timer.stop()
         self._route_refresh_timer.stop()
         try:
@@ -1914,6 +1920,11 @@ class MainWindow(QMainWindow):
             self.motion.start()
         else:
             self.motion.stop()
+        if self._ai_prediction_on:
+            self._prediction_tick_t = 0.0
+            self._prediction_timer.start()
+        else:
+            self._prediction_timer.stop()
 
     def on_ai_prediction_toggled(self, on: bool):
         self._ai_prediction_on = bool(on)
@@ -1925,9 +1936,40 @@ class MainWindow(QMainWindow):
                 self.map_view.set_player(self._last_player)
             self.status_label.setText("AI Prediction off")
         else:
-            self.status_label.setText("AI Prediction on · calibrating from V pings")
+            self.status_label.setText("AI Prediction on · walk/run between V pings")
             self._apply_live_marker()
         self._update_tracking_debug()
+
+    def _prediction_keys(self) -> dict:
+        if self.in_raid and eft_is_foreground():
+            return movement_keys()
+        return {}
+
+    def _keys_moving(self, keys: dict | None = None) -> bool:
+        keys = keys if keys is not None else self._prediction_keys()
+        return bool(keys.get("forward") or keys.get("back") or keys.get("left") or keys.get("right"))
+
+    def _on_prediction_tick(self):
+        if not self._ai_prediction_on or not self.predictor.state.has_fix:
+            return
+        now = time.perf_counter()
+        dt = 0.05 if not self._prediction_tick_t else now - self._prediction_tick_t
+        self._prediction_tick_t = now
+        yaw = self.heading.game_yaw if self.heading.has_heading else self.predictor.state.predicted_yaw
+        self.predictor.apply_controls(
+            dt,
+            self._prediction_keys(),
+            yaw,
+            bounds=self.map_view.map_bounds,
+            rotation=self.map_view.map_rotation,
+            transform=self.map_view.map_transform,
+        )
+        self._apply_live_marker()
+        live = self._live_player_state()
+        if live and self.compass is not None:
+            self.compass.set_player_xz(live.x, live.z)
+        if live:
+            self.heading.set_player_xz(live.x, live.z)
 
     def _audio_game_yaw(self):
         if self.heading.has_heading:
@@ -1936,7 +1978,7 @@ class MainWindow(QMainWindow):
 
     def _audio_motion(self):
         keys = movement_keys()
-        keys_moving = bool(keys.get("forward") or keys.get("back") or keys.get("left") or keys.get("right"))
+        keys_moving = self._keys_moving(keys)
         speed = float(self.predictor.state.speed or 0.0) if self.predictor.state.has_fix else 0.0
         return {"speed": speed, "keys_moving": keys_moving}
 
@@ -2049,6 +2091,7 @@ class MainWindow(QMainWindow):
             bounds=self.map_view.map_bounds,
             rotation=self.map_view.map_rotation,
             transform=self.map_view.map_transform,
+            skip_translation=self._ai_prediction_on and self._keys_moving(),
         )
         if self.predictor.state.has_fix:
             self.predictor.state.predicted_yaw = self.heading.game_yaw
