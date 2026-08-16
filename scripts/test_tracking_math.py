@@ -211,6 +211,61 @@ def test_loot_index_roundtrip():
     assert hits >= 8
 
 
+def test_item_name_lookup():
+    from wmnavi.loot_names import ItemNameIndex, normalize_item_name
+    from wmnavi.models import ItemInfo
+
+    assert normalize_item_name("  Pack of Sugar ") == "pack of sugar"
+    catalog = {
+        "sugar": ItemInfo("sugar", "Pack of sugar", "Sugar", "", 25000, 0, ""),
+        "bolts": ItemInfo("bolts", "Bolts", "Bolts", "", 12000, 0, ""),
+        "ak": ItemInfo("ak", "Kalashnikov AK-74M 5.45x39 assault rifle", "AK-74M", "", 40000, 0, ""),
+    }
+    idx = ItemNameIndex(catalog)
+    hit = idx.lookup("Pack of sugar")
+    assert hit and hit[0] == "sugar" and hit[1] >= 0.99
+    fuzzy = idx.lookup("Pack of sugor")
+    assert fuzzy and fuzzy[0] == "sugar"
+    short = idx.lookup("AK-74M")
+    assert short and short[0] == "ak"
+    assert idx.lookup("zzzz not an item") is None
+
+
+def test_tooltip_title_band():
+    import cv2
+    import numpy as np
+
+    from wmnavi.loot_tooltip import find_title_bands
+
+    img = np.zeros((360, 520, 3), dtype=np.uint8)
+    img[:] = (70, 64, 58)
+    img[50:170, 180:500] = (24, 22, 18)
+    cv2.putText(img, "Pack of sugar", (196, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (80, 210, 230), 2, cv2.LINE_AA)
+    bands = find_title_bands(img)
+    assert bands, "expected a dark tooltip title band"
+    crop, score = bands[0]
+    assert crop.shape[0] >= 20 and crop.shape[1] >= 80
+    assert score > 0.2
+
+
+def test_windows_ocr_tooltip_text():
+    import cv2
+    import numpy as np
+
+    from wmnavi.loot_tooltip import _ocr_engine, _ocr_image, find_title_bands
+
+    engine = _ocr_engine()
+    if engine is None:
+        return
+    img = np.zeros((160, 420, 3), dtype=np.uint8)
+    img[:] = (22, 20, 18)
+    cv2.putText(img, "Pack of sugar", (18, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (80, 210, 230), 2, cv2.LINE_AA)
+    bands = find_title_bands(img)
+    crop = bands[0][0] if bands else img
+    text = _ocr_image(engine, crop)
+    assert "sugar" in text.lower()
+
+
 def main() -> int:
     test_wrap_and_shortest()
     test_heading_visual_then_correct()
@@ -224,6 +279,9 @@ def main() -> int:
     test_audio_ild_right_positive()
     test_audio_classes()
     test_loot_index_roundtrip()
+    test_item_name_lookup()
+    test_tooltip_title_band()
+    test_windows_ocr_tooltip_text()
     print("TRACKING MATH OK")
     return 0
 

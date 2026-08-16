@@ -96,12 +96,12 @@ class LootValueHud(QWidget):
             sub_color = QColor(250, 204, 21)
         elif status == "identifying":
             title = "Identifying…"
-            sub = "Checking item picture"
+            sub = "Checking name and picture"
             badge = "Detecting"
             sub_color = QColor(196, 181, 253)
         elif status == "no_match":
             title = "No match"
-            sub = "Keep hovering the icon"
+            sub = "Hover until the name box appears"
             badge = "Detecting"
             sub_color = QColor(156, 163, 175)
         else:
@@ -134,6 +134,7 @@ class LootValueHud(QWidget):
                 w - 28,
                 44,
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-                f"{m.confidence * 100:.1f}%  ham {m.hamming}  {m.latency_ms:.0f}ms  {m.reason}",
+                f"{m.confidence * 100:.1f}%  ham {m.hamming}  {m.latency_ms:.0f}ms  {m.reason}"
+                + (f"  ocr {m.ocr_text}" if m.ocr_text else ""),
             )
         painter.end()

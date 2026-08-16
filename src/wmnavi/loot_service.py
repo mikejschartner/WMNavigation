@@ -8,6 +8,8 @@ from .loot_index import ItemIconIndex
 from .loot_overlay import LootValueHud
 from .loot_recognize import HIDE_MS, HoverRecognizer, LootMatch
 from .loot_loader import load_items_catalog
+from .loot_names import ItemNameIndex
+from .loot_tooltip import warmup_ocr
 from .models import ItemInfo
 
 
@@ -28,6 +30,7 @@ class LootValueService(QObject):
         self.last: LootMatch | None = None
         self.index_size = 0
         self.index_ms = 0.0
+        self.names = ItemNameIndex()
 
     @property
     def active(self) -> bool:
@@ -43,11 +46,13 @@ class LootValueService(QObject):
             return
         self.catalog = load_items_catalog(game_mode) or {}
         n = self.index.build(self.catalog)
+        self.names = ItemNameIndex(self.catalog)
         self.index_size = n
         self.index_ms = self.index.built_at * 1000.0
-        self.recognizer = HoverRecognizer(self.index)
+        self.recognizer = HoverRecognizer(self.index, self.names)
         self._on = True
         self._timer.start()
+        QTimer.singleShot(0, warmup_ocr)
 
     def stop(self):
         self._on = False

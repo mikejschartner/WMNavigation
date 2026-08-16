@@ -612,8 +612,8 @@ class MainWindow(QMainWindow):
         self.btn_loot_value = QPushButton("Loot Value")
         self.btn_loot_value.setCheckable(True)
         self.btn_loot_value.setToolTip(
-            "Hover an item in Tarkov. Uses your existing item pictures and prices.\n"
-            "Only looks at a small area around the cursor — not the whole screen."
+            "Hover an item in Tarkov. Reads the name tooltip, then looks up flea/trader price.\n"
+            "Falls back to your cached item pictures if the name box is not visible yet."
         )
         self.btn_loot_value.toggled.connect(self.on_loot_value_toggled)
         top_row.addWidget(self.btn_loot_value)
@@ -1989,7 +1989,7 @@ class MainWindow(QMainWindow):
             self.loot.start(self.current_game_mode)
             n = self.loot.index_size
             self.status_label.setText(
-                f"Loot Value on · {n} cached item pictures · hover an item in Tarkov"
+                f"Loot Value on · {n} cached pictures · hover until the item name box appears"
             )
             if n == 0:
                 self.status_label.setText(
@@ -2165,7 +2165,8 @@ class MainWindow(QMainWindow):
         return (
             f"LOOT {m.status} {m.reason} {m.name or m.item_id or '—'} "
             f"{m.confidence * 100:.0f}% ham {m.hamming} {m.latency_ms:.0f}ms "
-            f"cur {m.cursor[0]},{m.cursor[1]} {'cache' if m.cache_hit else 'live'} [{cands}]"
+            f"cur {m.cursor[0]},{m.cursor[1]} {m.source or ('cache' if m.cache_hit else 'live')} "
+            f"{('ocr ' + m.ocr_text[:24]) if m.ocr_text else ''} [{cands}]"
         )
 
     def _available_extracts(self) -> list:

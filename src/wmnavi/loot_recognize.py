@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from .loot_index import ItemIconIndex
+from .loot_names import ItemNameIndex
+from .loot_tooltip import read_tooltip_name
 from .win_capture import capture_eft_patch_bgr
 from .win_input import cursor_in_eft_client
 
@@ -19,6 +21,8 @@ HOLD_PX = 54  # ~one Tarkov stash cell — keep the last find while the tooltip 
 PATCH = 176
 HIGH_CONF = 0.86
 SHOW_CONF = 0.70
+NAME_CONF = 0.86
+OCR_EVERY = 0.22
 CACHE_MAX = 220
 
 
@@ -37,16 +41,21 @@ class LootMatch:
     cursor: tuple[int, int] = (0, 0)
     reason: str = ""
     status: str = "away"  # away | searching | identifying | found | no_match
+    ocr_text: str = ""
+    source: str = ""  # name | picture | cache
 
 
 class HoverRecognizer:
-    def __init__(self, index: ItemIconIndex):
+    def __init__(self, index: ItemIconIndex, names: ItemNameIndex | None = None):
         self.index = index
+        self.names = names or ItemNameIndex()
         self._last_xy: tuple[int, int] | None = None
         self._still_since = 0.0
         self._held: LootMatch | None = None
         self._held_xy: tuple[int, int] | None = None
         self._cache: OrderedDict[int, tuple[str, float, float]] = OrderedDict()
+        self._last_ocr_at = 0.0
+        self._client_wh = (0, 0)
         self.debug = LootMatch(reason="idle", status="away")
 
     def reset(self):
@@ -54,6 +63,7 @@ class HoverRecognizer:
         self._still_since = 0.0
         self._held = None
         self._held_xy = None
+        self._last_ocr_at = 0.0
         self.debug = LootMatch(reason="idle", status="away")
 
     def tick(self, catalog_lookup) -> LootMatch | None:
@@ -64,12 +74,17 @@ class HoverRecognizer:
             self.reset()
             self.debug = LootMatch(reason="cursor not over Tarkov", status="away")
             return None
-        _hwnd, cx, cy, _w, _h = loc
+        _hwnd, cx, cy, client_w, client_h = loc
         now = time.perf_counter()
         xy = (cx, cy)
+        self._client_wh = (int(client_w), int(client_h))
 
         if self._held and self._held_xy:
             if abs(cx - self._held_xy[0]) + abs(cy - self._held_xy[1]) <= HOLD_PX:
+                if self._held.source != "name":
+                    named = self._try_name(xy, cx, cy, t0, catalog_lookup)
+                    if named is not None:
+                        return named
                 held = self._held
                 held.cursor = xy
                 self._last_xy = xy
@@ -93,6 +108,38 @@ class HoverRecognizer:
 
         return self._identify(xy, cx, cy, now, t0, catalog_lookup)
 
+    def _try_name(self, xy, cx, cy, t0: float, catalog_lookup) -> LootMatch | None:
+        if not self.names or not self.names._entries:
+            return None
+        now = time.perf_counter()
+        if now - self._still_since < 0.22:
+            return None
+        if now - self._last_ocr_at < OCR_EVERY:
+            return None
+        self._last_ocr_at = now
+        cw, ch = self._client_wh
+        text, _band = read_tooltip_name(cx, cy, cw, ch)
+        if not text:
+            return None
+        hit = self.names.lookup(text)
+        if not hit or hit[1] < NAME_CONF:
+            return None
+        item_id, score, why = hit
+        return self._hold(
+            xy,
+            item_id,
+            score,
+            0,
+            [],
+            0,
+            t0,
+            catalog_lookup,
+            cache=False,
+            source="name",
+            reason=f"name {why}",
+            ocr_text=text,
+        )
+
     def _status(self, xy, status: str, reason: str, t0: float) -> LootMatch:
         m = LootMatch(
             cursor=xy,
@@ -104,6 +151,10 @@ class HoverRecognizer:
         return m
 
     def _identify(self, xy, cx, cy, now: float, t0: float, catalog_lookup) -> LootMatch:
+        named = self._try_name(xy, cx, cy, t0, catalog_lookup)
+        if named is not None:
+            return named
+
         patch = capture_eft_patch_bgr(cx, cy, PATCH)
         if patch is None:
             return self._status(xy, "searching", "capture empty/black", t0)
@@ -118,7 +169,7 @@ class HoverRecognizer:
             if conf >= SHOW_CONF:
                 return self._hold(xy, item_id, conf, 0, [], ch, t0, catalog_lookup, cache=True)
 
-        identifying = self._status(xy, "identifying", "matching", t0)
+        identifying = self._status(xy, "identifying", "matching picture", t0)
         cands = self.index.query(crop, top_k=8)
         best_id, best_ncc, ham = ("", 0.0, 99)
         if cands:
@@ -137,7 +188,7 @@ class HoverRecognizer:
             return self._hold(xy, best_id, conf, ham, cands[:5], ch, t0, catalog_lookup, cache=False)
 
         identifying.status = "no_match"
-        identifying.reason = "low confidence" if cands else "no candidates"
+        identifying.reason = "low confidence" if cands else "waiting for name tooltip"
         self.debug = identifying
         return identifying
 
@@ -153,8 +204,20 @@ class HoverRecognizer:
         catalog_lookup,
         *,
         cache: bool,
+        source: str = "",
+        reason: str = "",
+        ocr_text: str = "",
     ) -> LootMatch:
         item = catalog_lookup(item_id)
+        if cache:
+            src = "cache"
+            why = "cache"
+        elif source == "name":
+            src = "name"
+            why = reason or "name"
+        else:
+            src = "picture"
+            why = "picture"
         match = LootMatch(
             item_id=item_id,
             name=getattr(item, "name", item_id) if item else item_id,
@@ -167,8 +230,10 @@ class HoverRecognizer:
             crop_hash=ch,
             latency_ms=(time.perf_counter() - t0) * 1000.0,
             cursor=xy,
-            reason="cache" if cache else "match",
+            reason=why,
             status="found",
+            ocr_text=ocr_text,
+            source=src,
         )
         self._held = match
         self._held_xy = xy

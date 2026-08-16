@@ -118,12 +118,8 @@ def capture_eft_bgr(max_width: int = 320):
     return bgr
 
 
-def capture_eft_patch_bgr(client_x: int, client_y: int, size: int = 192):
-    """Native-resolution crop around a Tarkov client point. Hover-only, not a second loop.
-
-    MotionTracker downscales the whole window to ~360px — too small for item icons.
-    This BitBlts a small patch at 1:1 only when the cursor has paused.
-    """
+def capture_eft_rect_bgr(x0: int, y0: int, w: int, h: int):
+    """Native-resolution crop of a Tarkov client rectangle."""
     try:
         import numpy as np
     except Exception:
@@ -136,11 +132,10 @@ def capture_eft_patch_bgr(client_x: int, client_y: int, size: int = 192):
         return None
     cw = int(rect.right - rect.left)
     ch = int(rect.bottom - rect.top)
-    size = max(64, int(size))
-    x0 = max(0, min(cw - 1, int(client_x) - size // 2))
-    y0 = max(0, min(ch - 1, int(client_y) - size // 2))
-    w = min(size, cw - x0)
-    h = min(size, ch - y0)
+    x0 = max(0, int(x0))
+    y0 = max(0, int(y0))
+    w = min(int(w), cw - x0)
+    h = min(int(h), ch - y0)
     if w < 32 or h < 32:
         return None
 
@@ -177,3 +172,41 @@ def capture_eft_patch_bgr(client_x: int, client_y: int, size: int = 192):
     if float(np.mean(bgr)) < 4.0:
         return None
     return bgr
+
+
+def capture_eft_patch_bgr(client_x: int, client_y: int, size: int = 192):
+    """Native-resolution crop around a Tarkov client point. Hover-only, not a second loop.
+
+    MotionTracker downscales the whole window to ~360px — too small for item icons.
+    This BitBlts a small patch at 1:1 only when the cursor has paused.
+    """
+    hwnd = find_eft_window()
+    if not hwnd:
+        return None
+    rect = wintypes.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(rect)):
+        return None
+    cw = int(rect.right - rect.left)
+    ch = int(rect.bottom - rect.top)
+    size = max(64, int(size))
+    x0 = max(0, min(cw - 1, int(client_x) - size // 2))
+    y0 = max(0, min(ch - 1, int(client_y) - size // 2))
+    w = min(size, cw - x0)
+    h = min(size, ch - y0)
+    return capture_eft_rect_bgr(x0, y0, w, h)
+
+
+def capture_eft_tooltip_bgr(client_x: int, client_y: int, client_w: int, client_h: int):
+    """Wider crop around the cursor so the hover name tooltip is in frame."""
+    cw = max(64, int(client_w))
+    ch = max(64, int(client_h))
+    cx, cy = int(client_x), int(client_y)
+    box_w, box_h = 640, 520
+    if cw - cx < 300:
+        x0 = max(0, cx - box_w + 80)
+    else:
+        x0 = max(0, cx - 56)
+    y0 = max(0, cy - box_h // 2)
+    w = min(box_w, cw - x0)
+    h = min(box_h, ch - y0)
+    return capture_eft_rect_bgr(x0, y0, w, h)
