@@ -71,10 +71,6 @@ class LootValueService(QObject):
         self.hud.debug = self.debug
         if match is None:
             self.hud.schedule_hide(HIDE_MS)
-            self.updated.emit(self.last)
-            return
-        if match.item_id:
-            self.hud.show_match(match)
         else:
-            self.hud.schedule_hide(HIDE_MS)
+            self.hud.show_match(match)
         self.updated.emit(self.last)

@@ -2120,7 +2120,7 @@ class MainWindow(QMainWindow):
             return f"LOOT idx {self.loot.index_size}"
         cands = ",".join(f"{cid[-6:]}:{sc:.2f}" for cid, sc, _h in (m.candidates or [])[:3]) or "-"
         return (
-            f"LOOT {m.reason} {m.name or m.item_id or '—'} "
+            f"LOOT {m.status} {m.reason} {m.name or m.item_id or '—'} "
             f"{m.confidence * 100:.0f}% ham {m.hamming} {m.latency_ms:.0f}ms "
             f"cur {m.cursor[0]},{m.cursor[1]} {'cache' if m.cache_hit else 'live'} [{cands}]"
         )
