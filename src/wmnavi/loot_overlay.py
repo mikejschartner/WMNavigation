@@ -68,8 +68,8 @@ class LootValueHud(QWidget):
         if screen is None:
             return
         geo = screen.availableGeometry()
-        w = 300 if not self.debug else 380
-        h = 92 if not self.debug else 128
+        w = 340 if not self.debug else 420
+        h = 96 if not self.debug else 132
         self.setFixedSize(w, h)
         x = geo.x() + geo.width() - w - 16
         y = geo.y() + 10
@@ -90,13 +90,14 @@ class LootValueHud(QWidget):
             return
         status = m.status or "searching"
         if status == "found":
-            title = m.short_name or m.name or m.item_id
-            sub = f"₽{m.price:,}" if m.price else "₽ —"
+            title = m.name or m.short_name or m.item_id
+            price = f"₽{m.price:,}" if m.price else "₽ —"
+            sub = f"{m.short_name}  ·  {price}" if m.short_name and m.short_name != m.name else price
             badge = "Item found"
             sub_color = QColor(250, 204, 21)
         elif status == "identifying":
             title = "Identifying…"
-            sub = "Checking name and picture"
+            sub = "Looking for the name box"
             badge = "Detecting"
             sub_color = QColor(196, 181, 253)
         elif status == "no_match":
@@ -121,6 +122,7 @@ class LootValueHud(QWidget):
         painter.drawText(14, 6, w - 28, 16, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, badge)
         painter.setPen(QColor(243, 232, 255))
         painter.setFont(QFont("Segoe UI", 12, QFont.Weight.DemiBold))
+        title = painter.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, w - 28)
         painter.drawText(14, 24, w - 28, 26, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title)
         painter.setPen(sub_color)
         painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))

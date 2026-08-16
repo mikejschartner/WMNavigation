@@ -10,7 +10,7 @@ import numpy as np
 
 from .loot_index import ItemIconIndex
 from .loot_names import ItemNameIndex
-from .loot_tooltip import read_tooltip_name
+from .loot_tooltip import ocr_available, read_tooltip_texts
 from .win_capture import capture_eft_patch_bgr
 from .win_input import cursor_in_eft_client
 
@@ -21,8 +21,8 @@ HOLD_PX = 54  # ~one Tarkov stash cell — keep the last find while the tooltip 
 PATCH = 176
 HIGH_CONF = 0.86
 SHOW_CONF = 0.70
-NAME_CONF = 0.84
-OCR_EVERY = 0.12
+NAME_CONF = 0.82
+OCR_EVERY = 0.10
 CACHE_MAX = 220
 
 
@@ -112,19 +112,27 @@ class HoverRecognizer:
         if not self.names or not self.names._entries:
             return None
         now = time.perf_counter()
-        if now - self._still_since < 0.12:
+        if now - self._still_since < 0.08:
             return None
         if now - self._last_ocr_at < OCR_EVERY:
             return None
         self._last_ocr_at = now
+        if not ocr_available():
+            return None
         cw, ch = self._client_wh
-        text, _band = read_tooltip_name(cx, cy, cw, ch)
-        if not text:
+        texts = read_tooltip_texts(cx, cy, cw, ch)
+        best = None
+        best_text = ""
+        for text, _score in texts:
+            hit = self.names.lookup(text)
+            if not hit or hit[1] < NAME_CONF:
+                continue
+            if best is None or hit[1] > best[1]:
+                best = hit
+                best_text = text
+        if best is None:
             return None
-        hit = self.names.lookup(text)
-        if not hit or hit[1] < NAME_CONF:
-            return None
-        item_id, score, why = hit
+        item_id, score, why = best
         return self._hold(
             xy,
             item_id,
@@ -137,7 +145,7 @@ class HoverRecognizer:
             cache=False,
             source="name",
             reason=f"name {why}",
-            ocr_text=text,
+            ocr_text=best_text,
         )
 
     def _status(self, xy, status: str, reason: str, t0: float) -> LootMatch:

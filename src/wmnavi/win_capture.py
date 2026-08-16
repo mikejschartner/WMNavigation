@@ -5,7 +5,12 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 
-from .win_input import find_eft_window
+from .win_input import cursor_screen_pos, find_eft_window
+
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -196,25 +201,70 @@ def capture_eft_patch_bgr(client_x: int, client_y: int, size: int = 192):
     return capture_eft_rect_bgr(x0, y0, w, h)
 
 
-def capture_eft_tooltip_bgr(client_x: int, client_y: int, client_w: int, client_h: int):
-    """Tight crop of the stash name chip: always above and to the right of the cursor.
+def capture_screen_rect_bgr(x0: int, y0: int, w: int, h: int, *, min_size: int = 16):
+    """BitBlt a desktop rectangle (what is on screen), including Tarkov UI tooltips."""
+    try:
+        import numpy as np
+    except Exception:
+        return None
+    vx = int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN))
+    vy = int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN))
+    vw = int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN))
+    vh = int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+    x0 = max(vx, int(x0))
+    y0 = max(vy, int(y0))
+    w = min(int(w), vx + vw - x0)
+    h = min(int(h), vy + vh - y0)
+    if w < min_size or h < min_size:
+        return None
+    hdc = user32.GetDC(0)
+    if not hdc:
+        return None
+    mem = gdi32.CreateCompatibleDC(hdc)
+    bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
+    old = gdi32.SelectObject(mem, bmp)
+    ok = gdi32.BitBlt(mem, 0, 0, w, h, hdc, x0, y0, SRCCOPY)
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = BI_RGB
+    buf = ctypes.create_string_buffer(w * h * 4)
+    got = 0
+    if ok:
+        got = gdi32.GetDIBits(mem, bmp, 0, h, buf, ctypes.byref(bmi), DIB_RGB_COLORS)
+    gdi32.SelectObject(mem, old)
+    gdi32.DeleteObject(bmp)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(0, hdc)
+    if not got:
+        return None
+    bgra = np.frombuffer(buf, dtype=np.uint8).reshape((h, w, 4))
+    bgr = bgra[:, :, :3].copy()
+    if float(np.mean(bgr)) < 4.0:
+        return None
+    return bgr
 
-    Tarkov only changes the box width with the name length. Near the right edge it
-    flips to above-left so the chip stays on screen.
-    """
+
+def capture_around_cursor_bgr(client_x: int, client_y: int, client_w: int, client_h: int):
+    """Grab left/right/above/below the cursor so the name chip is in frame wherever it pops."""
+    left, up, right, down = 400, 130, 520, 110
+    sx, sy = cursor_screen_pos()
+    screen = capture_screen_rect_bgr(sx - left, sy - up, left + right, up + down, min_size=16)
+    if screen is not None:
+        return screen
     cw = max(64, int(client_w))
     ch = max(64, int(client_h))
     cx, cy = int(client_x), int(client_y)
-    box_w, box_h = 520, 86
-    gap_x, gap_y = 12, 10
-    if cw - cx < 120:
-        x0 = max(0, cx - gap_x - box_w)
-    else:
-        x0 = min(max(0, cx + gap_x), max(0, cw - 48))
-    y0 = max(0, cy - gap_y - box_h)
-    w = min(box_w, cw - x0)
-    h = min(box_h, max(16, cy - gap_y - y0))
-    if h < 16:
-        y0 = max(0, cy - box_h)
-        h = min(box_h, ch - y0)
+    x0 = max(0, cx - left)
+    y0 = max(0, cy - up)
+    w = min(left + right, cw - x0)
+    h = min(up + down, ch - y0)
     return capture_eft_rect_bgr(x0, y0, w, h, min_size=16)
+
+
+def capture_eft_tooltip_bgr(client_x: int, client_y: int, client_w: int, client_h: int):
+    """Name-chip search crop around the cursor, any side."""
+    return capture_around_cursor_bgr(client_x, client_y, client_w, client_h)

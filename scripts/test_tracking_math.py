@@ -234,14 +234,14 @@ def test_item_name_lookup():
     assert idx.lookup("zzzz not an item") is None
 
 
-def _stash_name_chip(text: str = "KEKTAPE duct tape"):
+def _stash_name_chip(text: str = "KEKTAPE duct tape", *, ox: int = 24, oy: int = 36):
     import cv2
     import numpy as np
 
-    img = np.full((86, 520, 3), (52, 48, 44), dtype=np.uint8)
-    tw = min(500, 22 + 11 * len(text))
+    img = np.full((240, 920, 3), (52, 48, 44), dtype=np.uint8)
+    tw = min(480, 22 + 11 * len(text))
     th = 26
-    x, y = 8, 86 - th - 10
+    x, y = ox, oy
     cv2.rectangle(img, (x, y), (x + tw, y + th), (8, 8, 8), -1)
     cv2.rectangle(img, (x, y), (x + tw, y + th), (186, 186, 186), 1)
     cv2.putText(
@@ -260,12 +260,13 @@ def _stash_name_chip(text: str = "KEKTAPE duct tape"):
 def test_tooltip_title_band():
     from wmnavi.loot_tooltip import find_name_chips
 
-    img = _stash_name_chip()
-    chips = find_name_chips(img)
-    assert chips, "expected the above-right stash name chip"
-    crop, score = chips[0]
-    assert crop.shape[0] >= 12 and crop.shape[1] >= 60
-    assert score > 0.2
+    for ox, oy in ((24, 36), (480, 20), (40, 180)):
+        img = _stash_name_chip(ox=ox, oy=oy)
+        chips = find_name_chips(img)
+        assert chips, f"expected name chip at {ox},{oy}"
+        crop, score = chips[0]
+        assert crop.shape[0] >= 12 and crop.shape[1] >= 60
+        assert score > 0.2
 
 
 def test_windows_ocr_tooltip_text():

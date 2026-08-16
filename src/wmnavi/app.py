@@ -612,8 +612,8 @@ class MainWindow(QMainWindow):
         self.btn_loot_value = QPushButton("Loot Value")
         self.btn_loot_value.setCheckable(True)
         self.btn_loot_value.setToolTip(
-            "Hover an item in Tarkov. Reads the name tooltip, then looks up flea/trader price.\n"
-            "Falls back to your cached item pictures if the name box is not visible yet."
+            "Hover an item in Tarkov. Reads the name box wherever it pops up around the cursor,\n"
+            "then shows the item name and flea/trader price. Picture match is only a backup."
         )
         self.btn_loot_value.toggled.connect(self.on_loot_value_toggled)
         top_row.addWidget(self.btn_loot_value)
