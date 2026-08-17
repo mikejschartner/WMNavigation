@@ -124,6 +124,23 @@ def cleanup_old_binaries(target: Path | None = None) -> None:
         old.unlink(missing_ok=True)
     except OSError:
         pass
+    purge_legacy_helpers()
+
+
+def purge_legacy_helpers() -> None:
+    """Old updaters used cmd+find; Windows Terminal opens that as a stuck blank tab."""
+    folders = [
+        user_data_dir() / "update",
+        current_exe().parent,
+        Path.home() / "Desktop",
+        Path.home() / "OneDrive" / "Desktop",
+    ]
+    for folder in folders:
+        for name in ("wmnavi_apply_update.bat", "WMNavigation_new.exe"):
+            try:
+                (folder / name).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _vbs_escape(path: str) -> str:
@@ -207,7 +224,30 @@ def _spawn_hidden(args: list[str]) -> None:
     )
 
 
-def apply_update(download_url: str, on_progress=None) -> Path:
+def _schedule_replace_and_restart(staged: Path) -> Path:
+    script = _write_apply_script(os.getpid(), staged, current_exe())
+    wscript = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe"
+    _spawn_hidden([str(wscript), "//nologo", "//B", str(script)])
+    return script
+
+
+def resume_pending_update() -> bool:
+    """Finish a download that already landed but whose cmd/find helper got stuck."""
+    purge_legacy_helpers()
+    staged = user_data_dir() / "update" / "WMNavigation.exe"
+    if not staged.exists() or staged.stat().st_size < 1_000_000:
+        return False
+    target = current_exe()
+    try:
+        if target.resolve() == staged.resolve():
+            return False
+        if target.exists() and target.stat().st_size == staged.stat().st_size:
+            staged.unlink(missing_ok=True)
+            return False
+    except OSError:
+        pass
+    _schedule_replace_and_restart(staged)
+    return True
     """Download the new exe, then schedule a hidden replace+single restart.
 
     on_progress(pct: int, text: str) — pct is 0-100, or -1 for indeterminate.
@@ -248,7 +288,4 @@ def apply_update(download_url: str, on_progress=None) -> Path:
         raise RuntimeError("Downloaded update looks too small")
 
     report(100, "Download complete · restarting…")
-    script = _write_apply_script(os.getpid(), staged, target)
-    wscript = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe"
-    _spawn_hidden([str(wscript), "//nologo", "//B", str(script)])
-    return script
+    return _schedule_replace_and_restart(staged)

@@ -82,11 +82,18 @@ def offer_startup_update(app: QApplication) -> bool:
     if not is_frozen():
         return False
 
+    from .updater import apply_update, check_for_update, resume_pending_update
+
+    if resume_pending_update():
+        dlg = UpdateProgressDialog()
+        dlg.set_progress(100, "Finishing previous update…")
+        dlg.show()
+        app.processEvents()
+        return True
+
     settings = QSettings("WMMods", "WMNavigation")
     if not settings.value("auto_update_check", True, type=bool):
         return False
-
-    from .updater import apply_update, check_for_update
 
     info = None
     error = None
