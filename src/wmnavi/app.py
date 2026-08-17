@@ -201,7 +201,7 @@ class MainWindow(QMainWindow):
         self.heading = HeadingTracker()
         self.compass = None
         self.motion = MotionTracker(self)
-        self.motion.sample.connect(self._on_motion_sample)
+        self.motion.sample.connect(self._on_motion_sample, Qt.ConnectionType.QueuedConnection)
         self._tracking_debug = False
         self.loot = LootValueService(self)
         self.loot.updated.connect(self._on_loot_updated)
@@ -1116,10 +1116,6 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
         if self.floor_combo.currentIndex() == idx:
-            # Still ensure map_view floor is set (e.g. after map reload).
-            self.map_view.set_floor(match)
-            if self._minimap_ok():
-                self.minimap.map_view.set_floor(match)
             return
         self.floor_combo.blockSignals(True)
         self.floor_combo.setCurrentIndex(idx)
@@ -1195,7 +1191,7 @@ class MainWindow(QMainWindow):
         )
         if self._last_player:
             mm.set_player(self._last_player)
-            self._refocus_minimap_view(mm)
+            self._refocus_minimap_view(mm, force_zoom=True)
         snaps = self.friend_sync.friends_snapshot() if self.friend_sync.room else {}
         mm.set_friends(list(snaps.values()), self.current_map_slug)
         if self._active_route and self._active_route.ok and self._active_route.waypoints:
@@ -1206,6 +1202,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("minimap_size", int(value))
         if self._minimap_ok():
             self.minimap.set_size_px(int(value))
+            self._refocus_minimap(force_zoom=True)
 
     def _minimap_radius_m(self) -> float:
         """Slider 1–20 → world meters shown around you on the F7 overlay."""
@@ -1221,7 +1218,17 @@ class MainWindow(QMainWindow):
         level = max(1, min(20, level))
         return max(0.004, 0.22 * (0.83 ** (level - 1)))
 
-    def _refocus_minimap_view(self, view) -> None:
+    def _refocus_minimap_view(self, view, *, force_zoom: bool = False) -> None:
+        zoom_key = (
+            int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 0,
+            int(getattr(self, "minimap_size", None).value()) if hasattr(self, "minimap_size") else 0,
+            id(view),
+        )
+        last = getattr(self, "_minimap_zoom_key", None)
+        if not force_zoom and last == zoom_key and view.player.isVisible():
+            view.centerOn(view.player)
+            return
+        self._minimap_zoom_key = zoom_key
         view.focus_around_player(
             self._minimap_focus_fraction(),
             radius_m=self._minimap_radius_m(),
@@ -1243,15 +1250,15 @@ class MainWindow(QMainWindow):
     def on_minimap_zoom_changed(self, value: int):
         self.settings.setValue("minimap_zoom", int(value))
         self._update_minimap_zoom_label()
-        self._refocus_minimap()
+        self._refocus_minimap(force_zoom=True)
 
-    def _refocus_minimap(self):
+    def _refocus_minimap(self, *, force_zoom: bool = False):
         if not self._minimap_ok() or not self.minimap.isVisible():
             return
         mm = self.minimap.map_view
         if self._last_player:
             mm.set_player(self._last_player)
-        self._refocus_minimap_view(mm)
+        self._refocus_minimap_view(mm, force_zoom=force_zoom)
         mm.viewport().update()
         self.minimap.update()
 
@@ -1265,7 +1272,7 @@ class MainWindow(QMainWindow):
             visible = self.minimap.toggle()
             if visible:
                 self._sync_minimap_map()
-                self._refocus_minimap()
+                self._refocus_minimap(force_zoom=True)
                 pct = int(self.minimap.opacity_tier() * 100)
                 self.status_label.setText(f"Mini map on · {pct}% opacity (F8 to cycle)")
             else:
@@ -1428,7 +1435,6 @@ class MainWindow(QMainWindow):
         if self._minimap_ok() and self.minimap.isVisible():
             live = self._live_player_state() or state
             self.minimap.map_view.set_player(live)
-            self.minimap.map_view.set_floor(self.map_view._floor)
             self._refocus_minimap_view(self.minimap.map_view)
         floor_label = self.floor_combo.currentText()
         self.status_label.setText(

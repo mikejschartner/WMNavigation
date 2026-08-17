@@ -87,7 +87,7 @@ class MotionTracker(QObject):
                 frames = 0
                 fps_t = now
             elapsed = now - t0
-            time.sleep(max(0.004, 0.028 - elapsed))
+            time.sleep(max(0.008, 0.05 - elapsed))
         self.fps = 0.0
 
     def _step(self, prev_gray, dt_hint: float = 0.03):

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QTransform, QWheelEvent
 from PySide6.QtSvgWidgets import QGraphicsSvgItem
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem,
@@ -19,7 +20,6 @@ from PySide6.QtWidgets import (
     QGraphicsSimpleTextItem,
     QGraphicsView,
 )
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPen, QPixmap, QTransform, QWheelEvent
 
 from .coords import PlayerState, crs_bounds_from_map, game_to_map
 from .heading import map_facing_deg
@@ -156,7 +156,8 @@ class MapView(QGraphicsView):
         self.setBackgroundBrush(QBrush(QColor("#0a0a0f")))
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
-        self.map_item: QGraphicsSvgItem | None = None
+        self._prefer_raster_art = False
+        self.map_item: QGraphicsItem | None = None
         self._tile_item: QGraphicsPixmapItem | None = None
         self._floor_tile_item: QGraphicsPixmapItem | None = None
         self._svg_source: str | None = None
@@ -246,7 +247,17 @@ class MapView(QGraphicsView):
         else:
             self.confirmed_ghost.hide()
 
+    def set_prefer_raster_art(self, on: bool = True):
+        """Rasterize SVG to a pixmap so tight overlay zoom still shows the map."""
+        self._prefer_raster_art = bool(on)
+
     def set_floor(self, floor: FloorOption):
+        if (
+            floor == self._floor
+            and self._applied_floor_key == self._floor_cache_key()
+            and self.map_item is not None
+        ):
+            return
         self._floor = floor
         self._apply_floor_visual()
         self.refresh_layers()
@@ -300,7 +311,7 @@ class MapView(QGraphicsView):
         if svg_path:
             self.map_item = QGraphicsSvgItem(svg_path)
             self.map_item.setZValue(0)
-            self.map_item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+            self.map_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
             self.scene.addItem(self.map_item)
             if transform and bounds:
                 self._place_map_art(self.map_item, svg_path)
@@ -308,6 +319,7 @@ class MapView(QGraphicsView):
                 self.crs_bounds = None
                 self.scene.setSceneRect(self.map_item.boundingRect())
             used_svg = True
+            self._maybe_rasterize_map_art()
 
         if not used_svg and map_meta and self.crs_bounds and map_meta.get("tilePath"):
             tile_result = stitch_map_tiles(
@@ -367,7 +379,7 @@ class MapView(QGraphicsView):
         old = self.map_item
         item = QGraphicsSvgItem(path)
         item.setZValue(0)
-        item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+        item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         if old is not None:
             item.setTransform(old.transform())
             item.setPos(old.pos())
@@ -377,6 +389,7 @@ class MapView(QGraphicsView):
             self._place_map_art(item, path)
         self.scene.addItem(item)
         self.map_item = item
+        self._maybe_rasterize_map_art()
 
     def _allowed_tile_paths(self) -> set[str]:
         meta = self._map_meta or {}
@@ -455,6 +468,45 @@ class MapView(QGraphicsView):
         elif self._floor_tile_item:
             self.scene.removeItem(self._floor_tile_item)
             self._floor_tile_item = None
+
+    def _maybe_rasterize_map_art(self):
+        """Turn the live SVG into a pixmap. Extreme overlay zoom blanks QGraphicsSvgItem."""
+        if not self._prefer_raster_art:
+            return
+        item = self.map_item
+        if not isinstance(item, QGraphicsSvgItem):
+            return
+        try:
+            renderer = item.renderer()
+            if renderer is None or not renderer.isValid():
+                return
+            local = item.boundingRect()
+            if local.width() < 1 or local.height() < 1:
+                return
+            max_edge = 4096.0
+            scale = min(max_edge / local.width(), max_edge / local.height(), 6.0)
+            width = max(64, int(local.width() * scale))
+            height = max(64, int(local.height() * scale))
+            pix = QPixmap(width, height)
+            pix.fill(QColor("#0a0a0f"))
+            painter = QPainter(pix)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            renderer.render(painter, QRectF(0, 0, width, height))
+            painter.end()
+            pix_item = QGraphicsPixmapItem(pix)
+            pix_item.setZValue(0)
+            pix_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+            sx = local.width() / width
+            sy = local.height() / height
+            pix_item.setTransform(QTransform.fromScale(sx, sy))
+            pix_item.setTransform(item.transform(), True)
+            pix_item.setPos(item.pos())
+            if item.scene():
+                self.scene.removeItem(item)
+            self.scene.addItem(pix_item)
+            self.map_item = pix_item
+        except Exception:
+            return
 
     def _in_map_bounds(self, mx: float, my: float) -> bool:
         if not self.crs_bounds:
@@ -950,8 +1002,10 @@ class MapView(QGraphicsView):
                 radius = None
         if radius is None:
             radius = span * max(0.003, min(0.55, float(fraction)))
+        radius = max(radius, 4.0)
         area = QRectF(pos.x() - radius, pos.y() - radius, radius * 2, radius * 2)
         # resetTransform is required — fitInView alone often no-ops when already zoomed.
         self.resetTransform()
         self.fitInView(area, Qt.AspectRatioMode.KeepAspectRatio)
+        self.centerOn(pos)
         self.viewport().update()
