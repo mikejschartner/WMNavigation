@@ -7,14 +7,20 @@ alwaysApply: true
 
 Never tag or publish a build that has not passed `python scripts/smoke_test.py`. That is why past releases crashed: they were shipped untested.
 
+Do not use GitHub Actions to build or publish. Tagging used to wait on a CI job; that delayed updates and still failed when GitHub’s API was down. Publish the exe from this machine after smoke passes.
+
 After user-facing work:
 
 1. Run `python scripts/smoke_test.py` (must print `SMOKE OK`). If it fails, fix it. Do not tag.
 2. Bump `src/wmnavi/__init__.py` (patch: 0.6.x).
 3. Commit with `Release 0.6.x: …`.
 4. Push `main`, tag `v0.6.x`, push the tag.
-5. GitHub Actions builds the exe only after the same smoke test. If CI fails, fix and ship a new version — do not tell the user it is live.
+5. Build locally: `python -m PyInstaller build.spec`
+6. Write `dist/latest.json` with version, downloadUrl `https://github.com/mikejschartner/WMNavigation/releases/download/v0.6.x/WMNavigation.exe`, and the commit message as releaseNotes.
+7. Publish with gh: `gh release create v0.6.x dist/WMNavigation.exe dist/latest.json --title v0.6.x --notes "Release 0.6.x: …"`
+8. Confirm `gh release view v0.6.x` shows the exe. If GitHub returns 503, retry the release create — do not tell the user it is live until the release exists with the exe.
 
-Do not commit the exe. Do not force-push.
+Do not commit the exe. Do not force-push. Do not add a GitHub Actions release workflow.
 
 Git: `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\TeamFoundation\Team Explorer\Git\cmd\git.exe`
+gh needs that Git on PATH.
