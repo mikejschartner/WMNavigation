@@ -115,6 +115,24 @@ def main() -> int:
         rect = mv.scene.sceneRect()
         if rect.width() < 40 or rect.height() < 40:
             raise RuntimeError(f"map scene empty: {rect}")
+        from wmnavi.map_view import MapView
+
+        overlay = MapView()
+        overlay.set_prefer_raster_art(True)
+        overlay.load_svg(
+            mv._svg_source,
+            mv.map_rotation,
+            mv.map_bounds,
+            mv.map_transform,
+            map_meta=mv._map_meta,
+            map_slug=mv._map_slug,
+        )
+        art = overlay.map_item or overlay._tile_item
+        if art is None:
+            raise RuntimeError("F7 overlay map graphic missing")
+        art_rect = art.sceneBoundingRect()
+        if art_rect.width() < rect.width() * 0.5 or art_rect.height() < rect.height() * 0.5:
+            raise RuntimeError(f"F7 overlay map misplaced: art={art_rect} scene={rect}")
         print(f"SMOKE OK v{__version__} title={title}")
         return 0
     except Exception:

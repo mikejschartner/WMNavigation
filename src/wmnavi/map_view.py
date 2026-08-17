@@ -251,11 +251,14 @@ class MapView(QGraphicsView):
         """Rasterize SVG to a pixmap so tight overlay zoom still shows the map."""
         self._prefer_raster_art = bool(on)
 
+    def _has_base_art(self) -> bool:
+        return self.map_item is not None or self._tile_item is not None
+
     def set_floor(self, floor: FloorOption):
         if (
             floor == self._floor
             and self._applied_floor_key == self._floor_cache_key()
-            and self.map_item is not None
+            and self._has_base_art()
         ):
             return
         self._floor = floor
@@ -311,7 +314,8 @@ class MapView(QGraphicsView):
         if svg_path:
             self.map_item = QGraphicsSvgItem(svg_path)
             self.map_item.setZValue(0)
-            self.map_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+            if not self._prefer_raster_art:
+                self.map_item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
             self.scene.addItem(self.map_item)
             if transform and bounds:
                 self._place_map_art(self.map_item, svg_path)
@@ -379,14 +383,18 @@ class MapView(QGraphicsView):
         old = self.map_item
         item = QGraphicsSvgItem(path)
         item.setZValue(0)
-        item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
-        if old is not None:
+        if not self._prefer_raster_art:
+            item.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
+        # Only copy transform from a live SVG. A raster pixmap already includes
+        # pixel-to-local scale; copying that onto a new SVG then rasterizing
+        # again shrinks the map off-screen while markers stay in CRS.
+        if old is not None and isinstance(old, QGraphicsSvgItem):
             item.setTransform(old.transform())
             item.setPos(old.pos())
-            if old.scene():
-                self.scene.removeItem(old)
         else:
             self._place_map_art(item, path)
+        if old is not None and old.scene():
+            self.scene.removeItem(old)
         self.scene.addItem(item)
         self.map_item = item
         self._maybe_rasterize_map_art()
@@ -436,7 +444,7 @@ class MapView(QGraphicsView):
     def _apply_floor_visual(self):
         """Toggle SVG floor groups (and optional tile overlays) for the active floor."""
         key = self._floor_cache_key()
-        if key == self._applied_floor_key and self.map_item is not None:
+        if key == self._applied_floor_key and self._has_base_art():
             return
         self._applied_floor_key = key
         floor = self._floor
@@ -480,13 +488,16 @@ class MapView(QGraphicsView):
             renderer = item.renderer()
             if renderer is None or not renderer.isValid():
                 return
-            local = item.boundingRect()
+            # Match _place_map_art: viewBox is the CRS frame, not a tight crop.
+            local = _parse_svg_viewbox(self._svg_source)
+            if local is None:
+                local = item.boundingRect()
             if local.width() < 1 or local.height() < 1:
                 return
             max_edge = 4096.0
-            scale = min(max_edge / local.width(), max_edge / local.height(), 6.0)
-            width = max(64, int(local.width() * scale))
-            height = max(64, int(local.height() * scale))
+            scale = min(max_edge / local.width(), max_edge / local.height())
+            width = max(64, int(round(local.width() * scale)))
+            height = max(64, int(round(local.height() * scale)))
             pix = QPixmap(width, height)
             pix.fill(QColor("#0a0a0f"))
             painter = QPainter(pix)
@@ -496,16 +507,25 @@ class MapView(QGraphicsView):
             pix_item = QGraphicsPixmapItem(pix)
             pix_item.setZValue(0)
             pix_item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-            sx = local.width() / width
-            sy = local.height() / height
-            pix_item.setTransform(QTransform.fromScale(sx, sy))
-            pix_item.setTransform(item.transform(), True)
-            pix_item.setPos(item.pos())
+            art = self._art_crs_bounds()
+            if art is not None:
+                min_x, max_x, min_y, max_y = art
+                sx = (max_x - min_x) / width
+                sy = (max_y - min_y) / height
+                pix_item.setTransform(QTransform.fromScale(sx, sy))
+                pix_item.setPos(min_x, min_y)
+            else:
+                sx = local.width() / width
+                sy = local.height() / height
+                pix_item.setTransform(QTransform.fromScale(sx, sy))
+                pix_item.setTransform(item.transform(), True)
+                pix_item.setPos(item.pos())
             if item.scene():
                 self.scene.removeItem(item)
             self.scene.addItem(pix_item)
             self.map_item = pix_item
         except Exception:
+            item.setCacheMode(QGraphicsItem.CacheMode.NoCache)
             return
 
     def _in_map_bounds(self, mx: float, my: float) -> bool:
