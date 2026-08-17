@@ -100,6 +100,14 @@ def main() -> int:
         pix = get_quest_marker(22, trader="Prapor")
         if pix.isNull() or pix.width() < 8:
             raise RuntimeError("quest trader marker failed")
+        from wmnavi.update_ui import UpdateProgressDialog
+
+        dlg = UpdateProgressDialog()
+        dlg.set_progress(40, "Downloading update… 40%")
+        if dlg.bar.value() != 40:
+            raise RuntimeError("update progress bar failed")
+        dlg.allow_close()
+        dlg.close()
         rect = mv.scene.sceneRect()
         if rect.width() < 40 or rect.height() < 40:
             raise RuntimeError(f"map scene empty: {rect}")

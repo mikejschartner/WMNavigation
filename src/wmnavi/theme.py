@@ -88,6 +88,21 @@ QSlider::handle:horizontal {{
     background: {ACCENT};
     border-radius: 7px;
 }}
+QProgressBar {{
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    background: rgba(255,255,255,0.06);
+    text-align: center;
+    min-height: 18px;
+    color: {TEXT};
+}}
+QProgressBar::chunk {{
+    background: {ACCENT};
+    border-radius: 7px;
+}}
+QDialog#updateDialog {{
+    background-color: {BG};
+}}
 QDialog {{
     background-color: {BG};
     color: {TEXT};

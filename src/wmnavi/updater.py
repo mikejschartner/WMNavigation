@@ -111,24 +111,118 @@ def check_for_update(timeout: float = 6.0) -> dict | None:
     }
 
 
-def apply_update(download_url: str, on_progress=None) -> Path | None:
-    """Download the new exe to LocalAppData, then replace+restart after exit.
-
-    Staging off OneDrive/Desktop avoids file locks that made updates hang or
-    look like crashes. Copy retries then fall back to launching the staged copy.
-    """
+def current_exe() -> Path:
     if is_frozen():
-        target = Path(sys.executable).resolve()
-    else:
-        target = Path.cwd() / "WMNavigation.exe"
+        return Path(sys.executable).resolve()
+    return Path.cwd() / "WMNavigation.exe"
 
+
+def cleanup_old_binaries(target: Path | None = None) -> None:
+    exe = target or current_exe()
+    old = exe.parent / (exe.name + ".old")
+    try:
+        old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _vbs_escape(path: str) -> str:
+    return path.replace('"', '""')
+
+
+def _write_apply_script(pid: int, staged: Path, target: Path) -> Path:
+    """Hidden wscript helper: wait for this PID, replace exe, start once. No cmd windows."""
+    update_dir = user_data_dir() / "update"
+    update_dir.mkdir(parents=True, exist_ok=True)
+    script = update_dir / f"apply_{pid}.vbs"
+    old = str(target.parent / (target.name + ".old"))
+    script.write_text(
+        "\r\n".join(
+            [
+                "Option Explicit",
+                f"Dim pid: pid = {int(pid)}",
+                f'Dim staged: staged = "{_vbs_escape(str(staged))}"',
+                f'Dim target: target = "{_vbs_escape(str(target))}"',
+                f'Dim oldp: oldp = "{_vbs_escape(old)}"',
+                "Dim sh, fso, n, t, launch",
+                'Set sh = CreateObject("WScript.Shell")',
+                'Set fso = CreateObject("Scripting.FileSystemObject")',
+                "t = 0",
+                "Do While ProcessAlive(pid) And t < 1200",
+                "  WScript.Sleep 250",
+                "  t = t + 1",
+                "Loop",
+                "WScript.Sleep 400",
+                "On Error Resume Next",
+                "If fso.FileExists(oldp) Then fso.DeleteFile oldp, True",
+                "Err.Clear",
+                "If fso.FileExists(target) Then fso.MoveFile target, oldp",
+                "n = 0",
+                "Do",
+                "  Err.Clear",
+                "  fso.CopyFile staged, target, True",
+                "  If Err.Number = 0 Then",
+                "    If fso.FileExists(target) Then",
+                "      If fso.GetFile(target).Size > 1000000 Then Exit Do",
+                "    End If",
+                "  End If",
+                "  n = n + 1",
+                "  WScript.Sleep 300",
+                "Loop While n < 50",
+                'If fso.FileExists(target) Then launch = target Else launch = staged',
+                'sh.Run """" & launch & """", 1, False',
+                "If fso.FileExists(oldp) Then fso.DeleteFile oldp, True",
+                "If launch = target And fso.FileExists(staged) Then fso.DeleteFile staged, True",
+                "If fso.FileExists(WScript.ScriptFullName) Then fso.DeleteFile WScript.ScriptFullName, True",
+                "WScript.Quit 0",
+                "",
+                "Function ProcessAlive(processId)",
+                "  On Error Resume Next",
+                "  Dim svc, procs",
+                '  Set svc = GetObject("winmgmts:\\\\.\\root\\cimv2")',
+                '  Set procs = svc.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE ProcessId=" & processId)',
+                "  ProcessAlive = (Not procs Is Nothing) And (procs.Count > 0)",
+                "End Function",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+def _spawn_hidden(args: list[str]) -> None:
+    flags = 0
+    flags |= int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+    flags |= int(getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
+    flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+    subprocess.Popen(
+        args,
+        cwd=str(user_data_dir() / "update"),
+        creationflags=flags,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def apply_update(download_url: str, on_progress=None) -> Path:
+    """Download the new exe, then schedule a hidden replace+single restart.
+
+    on_progress(pct: int, text: str) — pct is 0-100, or -1 for indeterminate.
+    Staging lives in LocalAppData so OneDrive/Desktop locks cannot stall the download.
+    """
+    target = current_exe()
     update_dir = user_data_dir() / "update"
     update_dir.mkdir(parents=True, exist_ok=True)
     staged = update_dir / "WMNavigation.exe"
 
-    if on_progress:
-        on_progress("Downloading update…")
+    def report(pct: int, text: str):
+        if on_progress:
+            on_progress(pct, text)
 
+    report(0, "Downloading update…")
     headers = {"User-Agent": f"WMNavigation/{__version__}"}
     resp = requests.get(download_url, timeout=(20, 180), headers=headers, stream=True)
     resp.raise_for_status()
@@ -136,69 +230,25 @@ def apply_update(download_url: str, on_progress=None) -> Path | None:
     got = 0
     last_pct = -1
     with staged.open("wb") as fh:
-        for chunk in resp.iter_content(chunk_size=1024 * 1024):
+        for chunk in resp.iter_content(chunk_size=256 * 1024):
             if not chunk:
                 continue
             fh.write(chunk)
             got += len(chunk)
-            if on_progress and total:
+            if total > 0:
                 pct = min(99, got * 100 // total)
                 if pct != last_pct:
                     last_pct = pct
-                    on_progress(f"Downloading update… {pct}%")
+                    report(pct, f"Downloading update… {pct}%")
+            elif on_progress and got % (5 * 1024 * 1024) < 256 * 1024:
+                report(-1, f"Downloading update… {got // (1024 * 1024)} MB")
 
     if staged.stat().st_size < 1_000_000:
         staged.unlink(missing_ok=True)
         raise RuntimeError("Downloaded update looks too small")
 
-    if on_progress:
-        on_progress("Download complete · restarting…")
-
-    bat = update_dir / "wmnavi_apply_update.bat"
-    pid = os.getpid()
-    bat.write_text(
-        "\r\n".join(
-            [
-                "@echo off",
-                "setlocal EnableExtensions",
-                f'set "TARGET={target}"',
-                f'set "STAGED={staged}"',
-                "ping -n 3 127.0.0.1 >nul",
-                ":wait",
-                f'tasklist /FI "PID eq {pid}" | find "{pid}" >nul',
-                "if not errorlevel 1 (",
-                "  ping -n 2 127.0.0.1 >nul",
-                "  goto wait",
-                ")",
-                'attrib -R "%TARGET%" >nul 2>&1',
-                "set /a N=0",
-                ":retry",
-                "set /a N+=1",
-                'copy /Y "%STAGED%" "%TARGET%" >nul 2>&1',
-                "if not errorlevel 1 goto launch_target",
-                "if %N% LSS 40 (",
-                "  ping -n 2 127.0.0.1 >nul",
-                "  goto retry",
-                ")",
-                'start "" "%STAGED%"',
-                "goto done",
-                ":launch_target",
-                'start "" "%TARGET%"',
-                'del "%STAGED%" >nul 2>&1',
-                ":done",
-                'del "%~f0" >nul 2>&1',
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(
-        subprocess, "DETACHED_PROCESS", 0
-    )
-    subprocess.Popen(
-        ["cmd", "/c", str(bat)],
-        cwd=str(update_dir),
-        creationflags=flags,
-        close_fds=True,
-    )
-    return bat
+    report(100, "Download complete · restarting…")
+    script = _write_apply_script(os.getpid(), staged, target)
+    wscript = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "wscript.exe"
+    _spawn_hidden([str(wscript), "//nologo", "//B", str(script)])
+    return script

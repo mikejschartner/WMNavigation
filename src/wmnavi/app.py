@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QLockFile, QObject, QSettings, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -66,7 +66,7 @@ from .map_view import LayerVisibility, MapView
 from .minimap import MiniMapWindow
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
 from .motion_tracker import MotionTracker
-from .paths import app_root, cache_dir
+from .paths import app_root, cache_dir, is_frozen, user_data_dir
 from .quest_loader import QuestInfo, load_quests_for_map, load_quests_split
 from .quest_log_sync import (
     QuestEvent,
@@ -240,6 +240,8 @@ class MainWindow(QMainWindow):
         self.update_failed.connect(self._on_update_failed)
         self._friend_prune_timer.start()
         QTimer.singleShot(300, self._start_global_hotkeys)
+        if not is_frozen():
+            QTimer.singleShot(800, self.check_for_updates)
 
     def _start_global_hotkeys(self):
         try:
@@ -627,7 +629,6 @@ class MainWindow(QMainWindow):
         self._sync_live_timer()
         self._select_map_combo(self.current_map_slug)
         self._update_price_labels()
-        QTimer.singleShot(800, self.check_for_updates)
 
     def _build_settings_widget(self):
         self.settings_widget = QWidget(self)
@@ -773,7 +774,7 @@ class MainWindow(QMainWindow):
             self.update_status.emit(f"Downloading v{remote}…")
             apply_update(
                 info["downloadUrl"],
-                on_progress=lambda text: self.update_status.emit(text),
+                on_progress=lambda pct, text: self.update_status.emit(text),
             )
             self.update_ready.emit(remote)
         except Exception as exc:
@@ -2339,6 +2340,23 @@ def run():
     try:
         app = QApplication(sys.argv)
         app.setApplicationName("WMNavigation")
+        app.setStyleSheet(STYLESHEET)
+
+        from .updater import cleanup_old_binaries
+
+        lock = QLockFile(str(user_data_dir() / "instance.lock"))
+        lock.setStaleLockTime(10000)
+        if not lock.tryLock(50):
+            return
+        app._wmnavi_lock = lock
+        cleanup_old_binaries()
+
+        if is_frozen():
+            from .update_ui import offer_startup_update
+
+            if offer_startup_update(app):
+                return
+
         window = MainWindow()
         window.resize(1400, 900)
         window.setMinimumSize(720, 420)
