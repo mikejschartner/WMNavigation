@@ -248,12 +248,14 @@ def resume_pending_update() -> bool:
         pass
     _schedule_replace_and_restart(staged)
     return True
+
+
+def apply_update(download_url: str, on_progress=None) -> Path:
     """Download the new exe, then schedule a hidden replace+single restart.
 
     on_progress(pct: int, text: str) — pct is 0-100, or -1 for indeterminate.
     Staging lives in LocalAppData so OneDrive/Desktop locks cannot stall the download.
     """
-    target = current_exe()
     update_dir = user_data_dir() / "update"
     update_dir.mkdir(parents=True, exist_ok=True)
     staged = update_dir / "WMNavigation.exe"

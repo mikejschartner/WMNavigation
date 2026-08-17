@@ -71,6 +71,10 @@ def main() -> int:
 
         from wmnavi.marker_icons import get_quest_marker
         from wmnavi.paths import app_root
+        from wmnavi.updater import apply_update, check_for_update, resume_pending_update
+
+        if not callable(apply_update) or not callable(check_for_update) or not callable(resume_pending_update):
+            raise RuntimeError("updater exports missing")
 
         if window.findChild(QScrollArea, "sidebarScroll") is None:
             raise RuntimeError("sidebarScroll missing")
