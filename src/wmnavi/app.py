@@ -53,7 +53,7 @@ from .route_planner import (
     should_refresh_route,
 )
 from .data_loader import get_interactive_map, list_map_names
-from .floors import FloorOption, build_floor_options, floor_for_y
+from .floors import FloorOption, build_floor_options, floor_for_player
 from .friend_sync import FriendSync, new_player_id, normalize_room_code
 from .hotkeys import GlobalHotkeys
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
         self.filtered_items: dict[str, ItemInfo] = {}
         self.selected_item_ids: set[str] = set()
         self.floor_options: list[FloorOption] = [FloorOption("All Floors", -10000, 10000)]
+        self._floor_vote_label: str | None = None
         self.map_quests: list[QuestInfo] = []
         self.anywhere_quests: list[QuestInfo] = []
         self.active_quest_ids: set[str] = set()
@@ -1253,8 +1254,14 @@ class MainWindow(QMainWindow):
             spots.extend(quest.spots)
         return spots
 
-    def _select_floor_for_y(self, y: float):
-        match = floor_for_y(y, self.floor_options)
+    def _select_floor_for_player(self, state: PlayerState):
+        match = floor_for_player(
+            state.x,
+            state.z,
+            state.y,
+            self.floor_options,
+            self.map_view._map_meta,
+        )
         if not match:
             return
         try:
@@ -1262,6 +1269,10 @@ class MainWindow(QMainWindow):
         except ValueError:
             return
         if self.floor_combo.currentIndex() == idx:
+            self._floor_vote_label = match.label
+            return
+        if self._floor_vote_label != match.label:
+            self._floor_vote_label = match.label
             return
         self.floor_combo.blockSignals(True)
         self.floor_combo.setCurrentIndex(idx)
@@ -1574,7 +1585,7 @@ class MainWindow(QMainWindow):
             z=state.z,
             transform=self.map_view.map_transform,
         )
-        self._select_floor_for_y(state.y)
+        self._select_floor_for_player(state)
         self._apply_live_marker()
         self.map_view.center_on_player()
         if self.compass is not None:
@@ -2383,6 +2394,7 @@ class MainWindow(QMainWindow):
         self._active_route = None
         self._route_kind = None
         self.floor_options = build_floor_options(meta)
+        self._floor_vote_label = None
         self.floor_combo.blockSignals(True)
         self.floor_combo.clear()
         for floor in self.floor_options:

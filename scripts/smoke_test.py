@@ -45,11 +45,17 @@ def main() -> int:
         app = QApplication.instance() or QApplication(sys.argv)
         app.setApplicationName("WMNavigation-smoke")
         math_test = Path(__file__).resolve().parent / "test_tracking_math.py"
+        floor_test = Path(__file__).resolve().parent / "test_floors.py"
         try:
             runpy.run_path(str(math_test), run_name="__main__")
         except SystemExit as exc:
             if exc.code not in (0, None):
                 raise RuntimeError(f"tracking math tests failed: {exc.code}") from exc
+        try:
+            runpy.run_path(str(floor_test), run_name="__main__")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                raise RuntimeError(f"floor select tests failed: {exc.code}") from exc
         window = MainWindow()
         window.show()
         QTimer.singleShot(400, app.quit)
