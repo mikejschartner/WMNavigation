@@ -681,6 +681,7 @@ class MapView(QGraphicsView):
         label: str = "",
         label_kind: str | None = None,
         pixel_offset: tuple[int, int] = (0, 0),
+        tooltip: str = "",
     ):
         mx, my, y = self._scene_pos(point)
         on_floor = self._on_active_floor(y)
@@ -690,7 +691,7 @@ class MapView(QGraphicsView):
         if not self._in_map_bounds(mx, my):
             return
         opacity = 1.0 if on_floor else 0.28
-        tooltip = label or (point.label if isinstance(point, MapPoint) else kind)
+        tooltip = tooltip or label or (point.label if isinstance(point, MapPoint) else kind)
         if kind == "item_hunt" and item is not None:
             tooltip = f"{item.name}\n₽{item.best_price:,}"
 
@@ -863,23 +864,25 @@ class MapView(QGraphicsView):
                 for spot in data.stationary_weapons:
                     self._add_marker(icon, spot, "stationary")
 
-            # Active quest objective markers
+            # Active quest objective markers — trader portraits, no floating quest names.
             if self._quest_spots:
-                quest_px = self._px(12)
-                pix_plain = get_quest_marker(quest_px, requires_key=False)
-                pix_key = get_quest_marker(quest_px, requires_key=True)
+                quest_px = self._px(22)
+                quest_pix: dict[tuple[str, bool], object] = {}
                 for spot in self._quest_spots:
-                    needs_key = bool((spot.meta or {}).get("requires_key"))
-                    tip = spot.label
-                    desc = (spot.meta or {}).get("description")
+                    meta = spot.meta or {}
+                    needs_key = bool(meta.get("requires_key"))
+                    trader = str(meta.get("trader") or "")
+                    cache_key = (trader, needs_key)
+                    pix = quest_pix.get(cache_key)
+                    if pix is None:
+                        pix = get_quest_marker(quest_px, requires_key=needs_key, trader=trader)
+                        quest_pix[cache_key] = pix
+                    quest_name = str(meta.get("quest_name") or spot.label or "")
+                    tip = f"{trader} · {quest_name}" if trader else quest_name
+                    desc = meta.get("description")
                     if desc:
-                        tip = f"{spot.label}\n{desc}"
-                    self._add_marker(
-                        pix_key if needs_key else pix_plain,
-                        spot,
-                        "quest",
-                        label=tip,
-                    )
+                        tip = f"{tip}\n{desc}"
+                    self._add_marker(pix, spot, "quest", tooltip=tip)
             self._redraw_friends()
         except Exception:
             import traceback

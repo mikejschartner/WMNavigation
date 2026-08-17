@@ -67,6 +67,39 @@ def main() -> int:
             raise RuntimeError("AI Prediction / Audio Indicator should be removed")
         if window.splitter.childrenCollapsible():
             raise RuntimeError("sidebar splitter must not be collapsible")
+        from PySide6.QtWidgets import QScrollArea
+
+        from wmnavi.marker_icons import get_quest_marker
+        from wmnavi.paths import app_root
+
+        if window.findChild(QScrollArea, "sidebarScroll") is None:
+            raise RuntimeError("sidebarScroll missing")
+        if not hasattr(window, "btn_settings") or not hasattr(window, "settings_widget"):
+            raise RuntimeError("Settings gear/dialog missing")
+        if not hasattr(window, "btn_sync_quests"):
+            raise RuntimeError("Sync quests button missing")
+        if not hasattr(window.layer_sidebar, "apply_preset"):
+            raise RuntimeError("layer sidebar apply_preset missing")
+        traders = app_root() / "assets" / "traders"
+        needed = [
+            "prapor.jpg",
+            "therapist.jpg",
+            "fence.jpg",
+            "skier.jpg",
+            "peacekeeper.jpg",
+            "mechanic.jpg",
+            "ragman.jpg",
+            "jaeger.jpg",
+            "lightkeeper.jpg",
+            "ref.jpg",
+            "btr-driver.png",
+        ]
+        missing = [name for name in needed if not (traders / name).exists()]
+        if missing:
+            raise RuntimeError(f"trader portraits missing: {missing}")
+        pix = get_quest_marker(22, trader="Prapor")
+        if pix.isNull() or pix.width() < 8:
+            raise RuntimeError("quest trader marker failed")
         rect = mv.scene.sceneRect()
         if rect.width() < 40 or rect.height() < 40:
             raise RuntimeError(f"map scene empty: {rect}")

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -56,7 +57,7 @@ from .friend_sync import FriendSync, new_player_id
 from .hotkeys import GlobalHotkeys
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
 from .item_filter_dialog import ItemFilterDialog
-from .layer_sidebar import MapLayersSidebar
+from .layer_sidebar import LAYER_PRESETS, CollapsibleSection, MapLayersSidebar
 from .log_watcher import LogWatcher, describe_log_search, find_log_dir
 from .loot_filter import items_at_spot, spots_for_selection, spots_passing_price, visible_map_items
 from .loot_loader import GAME_MODES
@@ -277,56 +278,145 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 10, 12, 10)
         side_layout.setSpacing(6)
 
+        header = QHBoxLayout()
         title = QLabel("WMNavigation")
         title.setObjectName("title")
-        side_layout.addWidget(title)
-
-        self.edition_label = QLabel(f"v{__version__}")
-        self.edition_label.setObjectName("edition")
-        side_layout.addWidget(self.edition_label)
+        header.addWidget(title, 1)
+        self.btn_settings = QPushButton("⚙")
+        self.btn_settings.setObjectName("settingsGear")
+        self.btn_settings.setFixedWidth(36)
+        self.btn_settings.setToolTip("Settings")
+        self.btn_settings.clicked.connect(self.open_settings)
+        header.addWidget(self.btn_settings)
+        side_layout.addLayout(header)
 
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("status")
         self.status_label.setWordWrap(True)
         side_layout.addWidget(self.status_label)
 
-        side_layout.addWidget(QLabel("Game Mode"))
+        scroll = QScrollArea()
+        scroll.setObjectName("sidebarScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_host = QWidget()
+        scroll_layout = QVBoxLayout(scroll_host)
+        scroll_layout.setContentsMargins(0, 0, 4, 0)
+        scroll_layout.setSpacing(8)
+
+        raid = CollapsibleSection("RAID", expanded=True)
         self.mode_combo = QComboBox()
+        self.mode_combo.setToolTip("Game mode")
         for label in GAME_MODES:
             self.mode_combo.addItem(label)
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
-        side_layout.addWidget(self.mode_combo)
-
-        side_layout.addWidget(QLabel("Map"))
         self.map_combo = QComboBox()
+        self.map_combo.setToolTip("Map")
         self.map_slug_by_label = {}
         for label, slug in list_map_names():
             self.map_combo.addItem(label)
             self.map_slug_by_label[label] = slug
         self.map_combo.currentTextChanged.connect(self.on_map_combo)
-        side_layout.addWidget(self.map_combo)
+        mode_map_row = QHBoxLayout()
+        mode_map_row.addWidget(self.mode_combo, 1)
+        mode_map_row.addWidget(self.map_combo, 1)
+        raid.body_layout.addLayout(mode_map_row)
+
+        self.friend_name_edit = QLineEdit()
+        self.friend_name_edit.setPlaceholderText("Display name")
+        self.friend_name_edit.setText(str(self.settings.value("friend_name", "") or ""))
+        self.friend_name_edit.setMaxLength(24)
+        raid.body_layout.addWidget(self.friend_name_edit)
+        self.friend_room_edit = QLineEdit()
+        self.friend_room_edit.setPlaceholderText("Room code (share with friends)")
+        self.friend_room_edit.setText(str(self.settings.value("friend_room", "") or ""))
+        self.friend_room_edit.setMaxLength(24)
+        raid.body_layout.addWidget(self.friend_room_edit)
+        friend_row = QHBoxLayout()
+        self.btn_friend_color = QPushButton("Color")
+        self.btn_friend_color.setToolTip("Color friends see you as on their map")
+        self.btn_friend_color.clicked.connect(self.pick_friend_color)
+        self._apply_friend_color_btn()
+        friend_row.addWidget(self.btn_friend_color)
+        self.btn_friend_join = QPushButton("Join")
+        self.btn_friend_join.clicked.connect(self.join_friend_room)
+        friend_row.addWidget(self.btn_friend_join)
+        self.btn_friend_leave = QPushButton("Leave")
+        self.btn_friend_leave.clicked.connect(self.leave_friend_room)
+        friend_row.addWidget(self.btn_friend_leave)
+        raid.body_layout.addLayout(friend_row)
+        self.friend_status_label = QLabel("Not in a room")
+        self.friend_status_label.setObjectName("status")
+        self.friend_status_label.setWordWrap(True)
+        raid.body_layout.addWidget(self.friend_status_label)
+
+        live_row = QHBoxLayout()
+        self.chk_live = QCheckBox("Continuous mode")
+        self.chk_live.setToolTip(
+            "While in raid, press V every N seconds for a live map track. Stops when you extract. F6 toggles this loop."
+        )
+        self.chk_live.setChecked(self.settings.value("live_mode", False, type=bool))
+        self.chk_live.stateChanged.connect(self.on_live_mode_changed)
+        live_row.addWidget(self.chk_live, 1)
+        self.live_interval = QSpinBox()
+        self.live_interval.setRange(2, 60)
+        self.live_interval.setSuffix(" s")
+        self.live_interval.setValue(int(self.settings.value("live_interval", 3)))
+        self.live_interval.setToolTip(
+            "Seconds between automatic V screenshots. Prediction fills the gaps — 2–3s is enough."
+        )
+        self.live_interval.valueChanged.connect(self.on_live_interval_changed)
+        live_row.addWidget(self.live_interval)
+        raid.body_layout.addLayout(live_row)
+
+        self.btn_center = QPushButton("Center on player")
+        self.btn_center.clicked.connect(self.center_player)
+        raid.body_layout.addWidget(self.btn_center)
+        self.pos_label = QLabel("Position: —")
+        self.pos_label.setObjectName("status")
+        raid.body_layout.addWidget(self.pos_label)
+        scroll_layout.addWidget(raid)
+
+        map_sec = CollapsibleSection("MAP", expanded=True)
+        preset_row = QHBoxLayout()
+        self.btn_preset_quests = QPushButton("Quests")
+        self.btn_preset_quests.setToolTip("Hide loot and containers; show PMC extracts and locked doors.")
+        self.btn_preset_quests.clicked.connect(lambda: self.apply_map_preset("quests"))
+        preset_row.addWidget(self.btn_preset_quests)
+        self.btn_preset_loot = QPushButton("Loot run")
+        self.btn_preset_loot.setToolTip("Loose loot, all containers, and PMC extracts.")
+        self.btn_preset_loot.clicked.connect(lambda: self.apply_map_preset("loot"))
+        preset_row.addWidget(self.btn_preset_loot)
+        self.btn_preset_extracts = QPushButton("Extracts")
+        self.btn_preset_extracts.setToolTip("All extract types and transits; hide loot and locks.")
+        self.btn_preset_extracts.clicked.connect(lambda: self.apply_map_preset("extracts"))
+        preset_row.addWidget(self.btn_preset_extracts)
+        map_sec.body_layout.addLayout(preset_row)
 
         self.layer_sidebar = MapLayersSidebar()
         self.layer_sidebar.changed.connect(self.on_layers_changed)
-        self.layer_sidebar.setMinimumHeight(80)
-        side_layout.addWidget(self.layer_sidebar, 3)
+        map_sec.body_layout.addWidget(self.layer_sidebar)
 
-        # Compact bottom controls so the layers list keeps most of the height.
-        bottom = QFrame()
-        bottom.setObjectName("sidebarBottom")
-        bottom_layout = QVBoxLayout(bottom)
-        bottom_layout.setContentsMargins(0, 4, 0, 0)
-        bottom_layout.setSpacing(4)
+        self.chk_show_locked_doors = QCheckBox("Show Locked Doors")
+        self.chk_show_locked_doors.setToolTip("Mark exact keyed door positions and the key name required.")
+        self.chk_show_locked_doors.setChecked(self.settings.value("show_locked_doors", False, type=bool))
+        self.chk_show_locked_doors.stateChanged.connect(self.on_show_locked_doors_changed)
+        map_sec.body_layout.addWidget(self.chk_show_locked_doors)
 
-        bottom_layout.addWidget(QLabel("Item Hunt Filters"))
+        self.extract_panel = ExtractAvailabilityPanel()
+        self.extract_panel.changed.connect(self.on_extracts_available_changed)
+        map_sec.body_layout.addWidget(self.extract_panel)
+        scroll_layout.addWidget(map_sec)
+
+        hunt = CollapsibleSection("HUNT", expanded=False)
         self.chk_price = QCheckBox("Min price filter")
-        # Migrate old dual flea/trader toggles into one.
         legacy_on = self.settings.value("flea_enabled", False, type=bool) or self.settings.value(
             "trader_enabled", False, type=bool
         )
         self.chk_price.setChecked(self.settings.value("price_enabled", legacy_on, type=bool))
         self.chk_price.stateChanged.connect(self.on_price_filter_changed)
-        bottom_layout.addWidget(self.chk_price)
+        hunt.body_layout.addWidget(self.chk_price)
         self.price_slider = QSlider(Qt.Orientation.Horizontal)
         self.price_slider.setRange(0, 1_000_000)
         self.price_slider.setSingleStep(25_000)
@@ -337,11 +427,10 @@ class MainWindow(QMainWindow):
         )
         self.price_slider.setValue(int(self.settings.value("min_price", legacy_min or 400_000)))
         self.price_slider.valueChanged.connect(self.on_price_filter_changed)
-        bottom_layout.addWidget(self.price_slider)
+        hunt.body_layout.addWidget(self.price_slider)
         self.price_value = QLabel("₽400,000")
-        bottom_layout.addWidget(self.price_value)
+        hunt.body_layout.addWidget(self.price_value)
 
-        bottom_layout.addWidget(QLabel("Quick show (by item)"))
         cat_row = QHBoxLayout()
         self.category_btns: dict[str, QPushButton] = {}
         for cat_id in CATEGORY_ORDER:
@@ -353,12 +442,12 @@ class MainWindow(QMainWindow):
             btn.toggled.connect(self.on_category_toggles)
             self.category_btns[cat_id] = btn
             cat_row.addWidget(btn)
-        bottom_layout.addLayout(cat_row)
+        hunt.body_layout.addLayout(cat_row)
 
         self.loot_stats = QLabel("Item hunt: —")
         self.loot_stats.setObjectName("status")
         self.loot_stats.setWordWrap(True)
-        bottom_layout.addWidget(self.loot_stats)
+        hunt.body_layout.addWidget(self.loot_stats)
 
         btn_row = QHBoxLayout()
         self.btn_filter = QPushButton("Filter Items...")
@@ -378,7 +467,7 @@ class MainWindow(QMainWindow):
         self.btn_select_filtered.setToolTip("Select every item that currently passes the min-price filter.")
         self.btn_select_filtered.clicked.connect(self.select_all_filtered)
         btn_row.addWidget(self.btn_select_filtered)
-        bottom_layout.addLayout(btn_row)
+        hunt.body_layout.addLayout(btn_row)
 
         self.chk_hide_locked_loot = QCheckBox("Hide Locked Room Loot")
         self.chk_hide_locked_loot.setToolTip(
@@ -386,86 +475,35 @@ class MainWindow(QMainWindow):
         )
         self.chk_hide_locked_loot.setChecked(self.settings.value("hide_locked_room_loot", False, type=bool))
         self.chk_hide_locked_loot.stateChanged.connect(self.on_hide_locked_loot_changed)
-        bottom_layout.addWidget(self.chk_hide_locked_loot)
+        hunt.body_layout.addWidget(self.chk_hide_locked_loot)
+        scroll_layout.addWidget(hunt)
 
-        self.chk_show_locked_doors = QCheckBox("Show Locked Doors")
-        self.chk_show_locked_doors.setToolTip("Mark exact keyed door positions and the key name required.")
-        self.chk_show_locked_doors.setChecked(self.settings.value("show_locked_doors", False, type=bool))
-        self.chk_show_locked_doors.stateChanged.connect(self.on_show_locked_doors_changed)
-        bottom_layout.addWidget(self.chk_show_locked_doors)
-
-        self.extract_panel = ExtractAvailabilityPanel()
-        self.extract_panel.changed.connect(self.on_extracts_available_changed)
-        bottom_layout.addWidget(self.extract_panel)
-
-        bottom_layout.addWidget(QLabel("Marker size"))
+        display = CollapsibleSection("DISPLAY", expanded=False)
+        display.body_layout.addWidget(QLabel("Marker size"))
         self.marker_scale_slider = QSlider(Qt.Orientation.Horizontal)
         self.marker_scale_slider.setRange(40, 250)
         self.marker_scale_slider.setValue(int(float(self.settings.value("marker_scale", 0.85)) * 100))
         self.marker_scale_slider.valueChanged.connect(self.on_marker_scale_changed)
-        bottom_layout.addWidget(self.marker_scale_slider)
+        display.body_layout.addWidget(self.marker_scale_slider)
         self.marker_scale_label = QLabel()
-        bottom_layout.addWidget(self.marker_scale_label)
+        display.body_layout.addWidget(self.marker_scale_label)
         self._update_marker_scale_label()
         self._marker_scale_timer = QTimer(self)
         self._marker_scale_timer.setSingleShot(True)
         self._marker_scale_timer.timeout.connect(self._apply_marker_scale)
 
-        self.chk_topmost = QCheckBox("Always on top")
-        self.chk_topmost.setChecked(self.settings.value("always_on_top", True, type=bool))
-        self.chk_topmost.stateChanged.connect(self.on_topmost)
-        bottom_layout.addWidget(self.chk_topmost)
-
-        self.chk_autodelete = QCheckBox("Auto-delete raid screenshots")
-        self.chk_autodelete.setChecked(self.auto_delete)
-        self.chk_autodelete.stateChanged.connect(self.on_autodelete_toggle)
-        bottom_layout.addWidget(self.chk_autodelete)
-
-        live_row = QHBoxLayout()
-        self.chk_live = QCheckBox("Continuous mode")
-        self.chk_live.setToolTip(
-            "While in raid, press V every N seconds for a live map track. Stops when you extract. F6 toggles this loop."
+        self.chk_overlay_same_markers = QCheckBox("Overlay uses same marker size")
+        self.chk_overlay_same_markers.setChecked(
+            self.settings.value("overlay_same_marker_size", True, type=bool)
         )
-        self.chk_live.setChecked(self.settings.value("live_mode", False, type=bool))
-        self.chk_live.stateChanged.connect(self.on_live_mode_changed)
-        live_row.addWidget(self.chk_live, 1)
-        self.live_interval = QSpinBox()
-        self.live_interval.setRange(2, 60)
-        self.live_interval.setSuffix(" s")
-        self.live_interval.setValue(int(self.settings.value("live_interval", 3)))
-        self.live_interval.setToolTip(
-            "Seconds between automatic V screenshots. Prediction fills the gaps — 2–3s is enough."
-        )
-        self.live_interval.valueChanged.connect(self.on_live_interval_changed)
-        live_row.addWidget(self.live_interval)
-        bottom_layout.addLayout(live_row)
+        self.chk_overlay_same_markers.stateChanged.connect(self.on_overlay_same_markers_changed)
+        display.body_layout.addWidget(self.chk_overlay_same_markers)
 
-        bottom_layout.addWidget(QLabel("Mini map (F7) · opacity (F8) · compass (F9)"))
-        self.minimap_size = QSpinBox()
-        self.minimap_size.setRange(180, 520)
-        self.minimap_size.setSuffix(" px")
-        self.minimap_size.setValue(int(self.settings.value("minimap_size", 300)))
-        self.minimap_size.setToolTip("Size of the F7 overlay on your main monitor")
-        self.minimap_size.valueChanged.connect(self.on_minimap_size_changed)
-        bottom_layout.addWidget(self.minimap_size)
-        bottom_layout.addWidget(QLabel("Mini map zoom"))
-        self.minimap_zoom = QSlider(Qt.Orientation.Horizontal)
-        self.minimap_zoom.setRange(1, 20)
-        saved_zoom = int(self.settings.value("minimap_zoom", 5))
-        self.minimap_zoom.setValue(max(1, min(20, saved_zoom)))
-        self.minimap_zoom.setToolTip("1 = wide area around you · 20 = very close overlay zoom")
-        self.minimap_zoom.valueChanged.connect(self.on_minimap_zoom_changed)
-        bottom_layout.addWidget(self.minimap_zoom)
-        self.minimap_zoom_label = QLabel()
-        bottom_layout.addWidget(self.minimap_zoom_label)
-        self._update_minimap_zoom_label()
-
-        self.chk_tracking_debug = QCheckBox("Tracking debug")
-        self.chk_tracking_debug.setToolTip("Show compass motion and loot-match numbers (not for normal raids).")
-        self.chk_tracking_debug.toggled.connect(self.on_tracking_debug_toggled)
-        bottom_layout.addWidget(self.chk_tracking_debug)
-
-        bottom_layout.addWidget(QLabel("Mini map marker size"))
+        self.minimap_marker_wrap = QWidget()
+        mm_wrap = QVBoxLayout(self.minimap_marker_wrap)
+        mm_wrap.setContentsMargins(0, 0, 0, 0)
+        mm_wrap.setSpacing(4)
+        mm_wrap.addWidget(QLabel("Mini map marker size"))
         self.minimap_marker_slider = QSlider(Qt.Orientation.Horizontal)
         self.minimap_marker_slider.setRange(40, 250)
         self.minimap_marker_slider.setValue(
@@ -473,71 +511,42 @@ class MainWindow(QMainWindow):
         )
         self.minimap_marker_slider.setToolTip("Size of loot/extract/quest markers on the F7 overlay only")
         self.minimap_marker_slider.valueChanged.connect(self.on_minimap_marker_scale_changed)
-        bottom_layout.addWidget(self.minimap_marker_slider)
+        mm_wrap.addWidget(self.minimap_marker_slider)
         self.minimap_marker_label = QLabel()
-        bottom_layout.addWidget(self.minimap_marker_label)
+        mm_wrap.addWidget(self.minimap_marker_label)
+        display.body_layout.addWidget(self.minimap_marker_wrap)
         self._update_minimap_marker_label()
         self._minimap_marker_timer = QTimer(self)
         self._minimap_marker_timer.setSingleShot(True)
         self._minimap_marker_timer.timeout.connect(self._apply_minimap_marker_scale)
+        self._sync_overlay_marker_visibility()
 
-        bottom_layout.addWidget(QLabel("Friend raid share"))
-        self.friend_name_edit = QLineEdit()
-        self.friend_name_edit.setPlaceholderText("Display name")
-        self.friend_name_edit.setText(str(self.settings.value("friend_name", "") or ""))
-        self.friend_name_edit.setMaxLength(24)
-        bottom_layout.addWidget(self.friend_name_edit)
-        self.friend_room_edit = QLineEdit()
-        self.friend_room_edit.setPlaceholderText("Room code (share with friends)")
-        self.friend_room_edit.setText(str(self.settings.value("friend_room", "") or ""))
-        self.friend_room_edit.setMaxLength(24)
-        bottom_layout.addWidget(self.friend_room_edit)
-        friend_row = QHBoxLayout()
-        self.btn_friend_color = QPushButton("Color")
-        self.btn_friend_color.setToolTip("Color friends see you as on their map")
-        self.btn_friend_color.clicked.connect(self.pick_friend_color)
-        self._apply_friend_color_btn()
-        friend_row.addWidget(self.btn_friend_color)
-        self.btn_friend_join = QPushButton("Join")
-        self.btn_friend_join.clicked.connect(self.join_friend_room)
-        friend_row.addWidget(self.btn_friend_join)
-        self.btn_friend_leave = QPushButton("Leave")
-        self.btn_friend_leave.clicked.connect(self.leave_friend_room)
-        friend_row.addWidget(self.btn_friend_leave)
-        bottom_layout.addLayout(friend_row)
-        self.friend_status_label = QLabel("Not in a room")
-        self.friend_status_label.setObjectName("status")
-        self.friend_status_label.setWordWrap(True)
-        bottom_layout.addWidget(self.friend_status_label)
+        display.body_layout.addWidget(QLabel("F7 overlay size"))
+        self.minimap_size = QSpinBox()
+        self.minimap_size.setRange(180, 520)
+        self.minimap_size.setSuffix(" px")
+        self.minimap_size.setValue(int(self.settings.value("minimap_size", 300)))
+        self.minimap_size.setToolTip("Size of the F7 overlay on your main monitor")
+        self.minimap_size.valueChanged.connect(self.on_minimap_size_changed)
+        display.body_layout.addWidget(self.minimap_size)
+        display.body_layout.addWidget(QLabel("Overlay zoom"))
+        self.minimap_zoom = QSlider(Qt.Orientation.Horizontal)
+        self.minimap_zoom.setRange(1, 20)
+        saved_zoom = int(self.settings.value("minimap_zoom", 5))
+        self.minimap_zoom.setValue(max(1, min(20, saved_zoom)))
+        self.minimap_zoom.setToolTip("1 = wide area around you · 20 = very close overlay zoom")
+        self.minimap_zoom.valueChanged.connect(self.on_minimap_zoom_changed)
+        display.body_layout.addWidget(self.minimap_zoom)
+        self.minimap_zoom_label = QLabel()
+        display.body_layout.addWidget(self.minimap_zoom_label)
+        self._update_minimap_zoom_label()
+        scroll_layout.addWidget(display)
 
-        bottom_layout.addWidget(QLabel("Tarkov screenshots (press V in-raid)"))
-        self.screenshot_path_label = QLabel(str(self.screenshot_dir))
-        self.screenshot_path_label.setObjectName("status")
-        self.screenshot_path_label.setWordWrap(True)
-        bottom_layout.addWidget(self.screenshot_path_label)
-        self.btn_screenshot_dir = QPushButton("Change screenshots folder...")
-        self.btn_screenshot_dir.clicked.connect(self.choose_screenshot_dir)
-        bottom_layout.addWidget(self.btn_screenshot_dir)
+        scroll_layout.addStretch(1)
+        scroll.setWidget(scroll_host)
+        side_layout.addWidget(scroll, 1)
 
-        self.btn_center = QPushButton("Center on player")
-        self.btn_center.clicked.connect(self.center_player)
-        bottom_layout.addWidget(self.btn_center)
-
-        self.btn_refresh = QPushButton("Refresh map data")
-        self.btn_refresh.clicked.connect(lambda: self.load_map(self.current_map_slug, force_fetch=True))
-        bottom_layout.addWidget(self.btn_refresh)
-
-        self.pos_label = QLabel("Position: —")
-        self.pos_label.setObjectName("status")
-        bottom_layout.addWidget(self.pos_label)
-
-        bottom_scroll = QScrollArea()
-        bottom_scroll.setWidgetResizable(True)
-        bottom_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        bottom_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        bottom_scroll.setWidget(bottom)
-        bottom_scroll.setMinimumHeight(80)
-        side_layout.addWidget(bottom_scroll, 2)
+        self._build_settings_widget()
 
         map_host = QWidget()
         map_layout = QVBoxLayout(map_host)
@@ -561,15 +570,13 @@ class MainWindow(QMainWindow):
         self.quest_btn.clicked.connect(self.open_quest_panel)
         top_row.addWidget(self.quest_btn)
         self._quest_panel: QuestListPanel | None = None
-        self.btn_import_quests = QPushButton("Import from logs")
-        self.btn_import_quests.setToolTip(
+        self.btn_sync_quests = QPushButton("Sync quests")
+        self.btn_sync_quests.setToolTip(
             "Same method as TarkovQuestie: read accept/complete from EFT client logs."
         )
-        self.btn_import_quests.clicked.connect(self.import_quests_from_logs)
-        top_row.addWidget(self.btn_import_quests)
-        self.btn_refresh_quests = QPushButton("Refresh quests")
-        self.btn_refresh_quests.clicked.connect(lambda: self.refresh_player_quests(silent=False))
-        top_row.addWidget(self.btn_refresh_quests)
+        self.btn_sync_quests.clicked.connect(self.import_quests_from_logs)
+        top_row.addWidget(self.btn_sync_quests)
+        self.btn_import_quests = self.btn_sync_quests
         self.btn_quest_route = QPushButton("Quest Route")
         self.btn_quest_route.setToolTip("Fastest route through currently selected quest objectives, ending at a checked extract.")
         self.btn_quest_route.clicked.connect(lambda: self.start_route("quest"))
@@ -622,6 +629,70 @@ class MainWindow(QMainWindow):
         self._update_price_labels()
         QTimer.singleShot(800, self.check_for_updates)
 
+    def _build_settings_widget(self):
+        self.settings_widget = QWidget(self)
+        layout = QVBoxLayout(self.settings_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.edition_label = QLabel(f"v{__version__}")
+        self.edition_label.setObjectName("edition")
+        layout.addWidget(self.edition_label)
+
+        self.chk_topmost = QCheckBox("Always on top")
+        self.chk_topmost.setChecked(self.settings.value("always_on_top", True, type=bool))
+        self.chk_topmost.stateChanged.connect(self.on_topmost)
+        layout.addWidget(self.chk_topmost)
+
+        self.chk_autodelete = QCheckBox("Auto-delete raid screenshots")
+        self.chk_autodelete.setChecked(self.auto_delete)
+        self.chk_autodelete.stateChanged.connect(self.on_autodelete_toggle)
+        layout.addWidget(self.chk_autodelete)
+
+        self.screenshot_path_label = QLabel(str(self.screenshot_dir))
+        self.screenshot_path_label.setObjectName("status")
+        self.screenshot_path_label.setWordWrap(True)
+        layout.addWidget(self.screenshot_path_label)
+        self.btn_screenshot_dir = QPushButton("Change folder")
+        self.btn_screenshot_dir.clicked.connect(self.choose_screenshot_dir)
+        layout.addWidget(self.btn_screenshot_dir)
+
+        self.chk_tracking_debug = QCheckBox("Tracking debug")
+        self.chk_tracking_debug.setToolTip("Show compass motion and loot-match numbers (not for normal raids).")
+        self.chk_tracking_debug.toggled.connect(self.on_tracking_debug_toggled)
+        layout.addWidget(self.chk_tracking_debug)
+
+        self.btn_refresh = QPushButton("Refresh map data")
+        self.btn_refresh.clicked.connect(lambda: self.load_map(self.current_map_slug, force_fetch=True))
+        layout.addWidget(self.btn_refresh)
+        layout.addStretch(1)
+        self.settings_widget.hide()
+
+    def open_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setModal(True)
+        lay = QVBoxLayout(dlg)
+        self.settings_widget.setParent(dlg)
+        self.settings_widget.show()
+        lay.addWidget(self.settings_widget)
+        try:
+            dlg.exec()
+        finally:
+            self.settings_widget.setParent(self)
+            self.settings_widget.hide()
+
+    def apply_map_preset(self, name: str):
+        spec = LAYER_PRESETS.get(name)
+        if not spec:
+            return
+        doors = name == "quests"
+        self.chk_show_locked_doors.blockSignals(True)
+        self.chk_show_locked_doors.setChecked(doors)
+        self.chk_show_locked_doors.blockSignals(False)
+        self.settings.setValue("show_locked_doors", doors)
+        self.layer_sidebar.apply_preset(spec)
+
     def _update_marker_scale_label(self):
         scale = self.marker_scale_slider.value() / 100.0
         self.marker_scale_label.setText(f"Marker size: {scale:.0%}")
@@ -634,14 +705,20 @@ class MainWindow(QMainWindow):
         scale = self.marker_scale_slider.value() / 100.0
         self.settings.setValue("marker_scale", scale)
         self.map_view.set_marker_scale(scale)
+        if self.chk_overlay_same_markers.isChecked() and self._minimap_ok():
+            self.minimap.map_view.set_marker_scale(scale)
 
     def _minimap_marker_scale(self) -> float:
+        if getattr(self, "chk_overlay_same_markers", None) is not None and self.chk_overlay_same_markers.isChecked():
+            if hasattr(self, "marker_scale_slider"):
+                return self.marker_scale_slider.value() / 100.0
+            return float(self.settings.value("marker_scale", 0.85))
         if hasattr(self, "minimap_marker_slider"):
             return self.minimap_marker_slider.value() / 100.0
         return float(self.settings.value("minimap_marker_scale", 0.7))
 
     def _update_minimap_marker_label(self):
-        scale = self._minimap_marker_scale()
+        scale = self.minimap_marker_slider.value() / 100.0
         self.minimap_marker_label.setText(f"Mini map markers: {scale:.0%}")
 
     def on_minimap_marker_scale_changed(self, _value: int):
@@ -650,9 +727,18 @@ class MainWindow(QMainWindow):
 
     def _apply_minimap_marker_scale(self):
         scale = self._minimap_marker_scale()
-        self.settings.setValue("minimap_marker_scale", scale)
+        if not self.chk_overlay_same_markers.isChecked():
+            self.settings.setValue("minimap_marker_scale", self.minimap_marker_slider.value() / 100.0)
         if self._minimap_ok():
             self.minimap.map_view.set_marker_scale(scale)
+
+    def on_overlay_same_markers_changed(self):
+        self.settings.setValue("overlay_same_marker_size", self.chk_overlay_same_markers.isChecked())
+        self._sync_overlay_marker_visibility()
+        self._apply_minimap_marker_scale()
+
+    def _sync_overlay_marker_visibility(self):
+        self.minimap_marker_wrap.setVisible(not self.chk_overlay_same_markers.isChecked())
 
     def _keep_sidebar_open(self, *_args):
         if not hasattr(self, "splitter"):

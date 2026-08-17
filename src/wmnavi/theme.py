@@ -124,4 +124,26 @@ QFrame#layerSection {{
 QFrame#sidebarBottom {{
     background: transparent;
 }}
+QPushButton#sectionToggle {{
+    text-align: left;
+    padding: 6px 10px;
+    background-color: rgba(168, 85, 247, 0.12);
+    border: 1px solid rgba(168, 85, 247, 0.28);
+    border-radius: 8px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}}
+QPushButton#sectionToggle:checked {{
+    background-color: rgba(168, 85, 247, 0.20);
+}}
+QPushButton#settingsGear {{
+    padding: 6px 8px;
+    font-size: 16px;
+    min-width: 36px;
+}}
+QFrame#sidebar QScrollArea#sidebarScroll {{
+    border: none;
+    min-height: 0;
+    background: transparent;
+}}
 """

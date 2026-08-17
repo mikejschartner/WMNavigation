@@ -2,18 +2,88 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QFrame,
-    QGridLayout,
     QLabel,
-    QScrollArea,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from .models import ContainerTypeInfo, MapLayerData
+
+LAYER_PRESETS: dict[str, dict[str, bool]] = {
+    "quests": {
+        "loose_loot": False,
+        "containers_all": False,
+        "extracts_all": False,
+        "extract_pmc": True,
+        "extract_scav": False,
+        "extract_coop": False,
+        "transits": False,
+        "locks": True,
+        "switches": False,
+        "stationary_weapons": False,
+    },
+    "loot": {
+        "loose_loot": True,
+        "containers_all": True,
+        "extracts_all": False,
+        "extract_pmc": True,
+        "extract_scav": False,
+        "extract_coop": False,
+        "transits": False,
+        "locks": False,
+        "switches": False,
+        "stationary_weapons": False,
+    },
+    "extracts": {
+        "loose_loot": False,
+        "containers_all": False,
+        "extracts_all": True,
+        "extract_pmc": True,
+        "extract_scav": True,
+        "extract_coop": True,
+        "transits": True,
+        "locks": False,
+        "switches": False,
+        "stationary_weapons": False,
+    },
+}
+
+
+class CollapsibleSection(QWidget):
+    """Checkable header that shows ▾ Title when open and ▸ Title when closed."""
+
+    def __init__(self, title: str, *, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        self._title = title
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 4)
+        layout.setSpacing(4)
+        self.toggle = QPushButton()
+        self.toggle.setObjectName("sectionToggle")
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(expanded)
+        self.toggle.toggled.connect(self._on_toggled)
+        layout.addWidget(self.toggle)
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(4, 0, 0, 4)
+        self.body_layout.setSpacing(4)
+        layout.addWidget(self.body)
+        self._sync_header()
+        self.body.setVisible(expanded)
+
+    def _on_toggled(self, on: bool):
+        self.body.setVisible(on)
+        self._sync_header()
+
+    def _sync_header(self):
+        arrow = "▾" if self.toggle.isChecked() else "▸"
+        self.toggle.setText(f"{arrow} {self._title}")
 
 
 class LayerSection(QFrame):
@@ -45,20 +115,14 @@ class LayerSection(QFrame):
             box.setChecked(checked)
 
 
-class MapLayersSidebar(QScrollArea):
+class MapLayersSidebar(QWidget):
     changed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setMinimumHeight(80)
-        self._host = QWidget()
-        self._layout = QVBoxLayout(self._host)
-        self._layout.setContentsMargins(8, 8, 8, 8)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(8)
-        self.setWidget(self._host)
         self.sections: dict[str, LayerSection] = {}
         self._suppress = False
 
@@ -71,7 +135,7 @@ class MapLayersSidebar(QScrollArea):
         self.sections.clear()
 
     def _add_section(self, key: str, title: str) -> LayerSection:
-        section = LayerSection(title, self._host)
+        section = LayerSection(title, self)
         self._layout.addWidget(section)
         self.sections[key] = section
         return section
@@ -146,7 +210,6 @@ class MapLayersSidebar(QScrollArea):
             settings.value(f"{settings_prefix}/stationary_weapons", False, type=bool),
         ).stateChanged.connect(self._emit_changed)
 
-        self._layout.addStretch(1)
         self._suppress = False
 
     def _emit_changed(self):
@@ -216,3 +279,16 @@ class MapLayersSidebar(QScrollArea):
         for section in self.sections.values():
             for key, box in section.checkboxes.items():
                 settings.setValue(f"{settings_prefix}/{key}", box.isChecked())
+
+    def apply_preset(self, spec: dict[str, bool]):
+        """Set known layer keys; every container:* box follows spec['containers_all']."""
+        all_containers = bool(spec.get("containers_all", False))
+        self._suppress = True
+        for section in self.sections.values():
+            for key, box in section.checkboxes.items():
+                if key.startswith("container:"):
+                    box.setChecked(all_containers)
+                elif key in spec:
+                    box.setChecked(bool(spec[key]))
+        self._suppress = False
+        self.changed.emit()

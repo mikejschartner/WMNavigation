@@ -367,6 +367,7 @@ def _spot_point(
     obj_type: str,
     optional: bool,
     requires_key: bool,
+    trader_name: str = "",
 ) -> MapPoint:
     return MapPoint(
         id=f"{task_id}_{obj_id}_{idx}",
@@ -383,6 +384,7 @@ def _spot_point(
             "type": obj_type,
             "optional": optional,
             "requires_key": requires_key,
+            "trader": trader_name,
         },
     )
 
@@ -454,6 +456,7 @@ def _spots_for_task(
     requires_key: bool,
     *,
     extracts: list[tuple[str, float, float, float]] | None = None,
+    trader_name: str = "",
 ) -> list[MapPoint]:
     spots: list[MapPoint] = []
     seen: set[tuple[int, int, int]] = set()
@@ -481,6 +484,7 @@ def _spots_for_task(
                 obj_type=obj_type,
                 optional=bool(obj.get("optional")),
                 requires_key=requires_key,
+                trader_name=trader_name,
             )
         )
 
@@ -646,7 +650,15 @@ def _build_quest_info(
         trader_id = trader_id.get("id") or ""
     trader_name = _trader_name(traders_labels, trader_id)
     spots = (
-        _spots_for_task(task, labels, map_ids, name, requires_key, extracts=extracts)
+        _spots_for_task(
+            task,
+            labels,
+            map_ids,
+            name,
+            requires_key,
+            extracts=extracts,
+            trader_name=trader_name,
+        )
         if map_ids
         else []
     )

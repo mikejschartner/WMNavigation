@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPixmap, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPixmap, QPen
 
 _ICON_CACHE: dict[str, QPixmap] = {}
 
@@ -183,46 +183,78 @@ def get_item_hunt_marker(
     return pix
 
 
-def get_quest_marker(size: float = 18, requires_key: bool = False) -> QPixmap:
-    """Gold quest pin; optional K badge for key-required quests."""
+def _draw_key_badge(painter: QPainter, sz: int):
+    badge = max(8, sz // 2)
+    painter.setBrush(QColor("#111827"))
+    painter.setPen(QPen(QColor("#fbbf24"), max(1, sz // 16)))
+    painter.drawEllipse(sz - badge - 1, 1, badge, badge)
+    painter.setPen(QColor("#fbbf24"))
+    kf = QFont("Segoe UI", max(5, badge // 2))
+    kf.setBold(True)
+    painter.setFont(kf)
+    painter.drawText(sz - badge - 1, 1, badge, badge, Qt.AlignmentFlag.AlignCenter, "K")
+
+
+def get_quest_marker(size: float = 18, requires_key: bool = False, trader: str = "") -> QPixmap:
+    """Trader portrait pin; gold diamond fallback. Optional K badge for keys."""
     size_i = max(8, int(round(size)))
-    cache = _cache_key("quest", f"k{int(requires_key)}", size_i)
+    trader_key = (trader or "").strip().lower()
+    cache = _cache_key("quest", f"{trader_key}|k{int(requires_key)}", size_i)
     if cache in _ICON_CACHE:
         return _ICON_CACHE[cache]
 
+    from .trader_icons import load_trader_portrait
+
+    portrait = load_trader_portrait(trader) if trader else None
+    has_portrait = portrait is not None and not portrait.isNull() and portrait.width() > 4
+    initial = "".join(ch for ch in (trader or "Q") if ch.isalnum())[:1].upper() or "Q"
+
     def draw(painter: QPainter, sz: int):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Shield / diamond body
-        from PySide6.QtCore import QPointF
-        from PySide6.QtGui import QPolygonF
+        if has_portrait:
+            scaled = portrait.scaled(
+                sz,
+                sz,
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            x = max(0, (scaled.width() - sz) // 2)
+            max_y = max(0, scaled.height() - sz)
+            y = int(max_y * 0.12)
+            cropped = scaled.copy(x, y, sz, sz)
+            path = QPainterPath()
+            inset = 1
+            path.addEllipse(inset, inset, sz - 2 * inset, sz - 2 * inset)
+            painter.save()
+            painter.setClipPath(path)
+            painter.drawPixmap(0, 0, cropped)
+            painter.restore()
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#e5e7eb"), max(1, sz // 14)))
+            painter.drawEllipse(inset, inset, sz - 2 * inset, sz - 2 * inset)
+        else:
+            from PySide6.QtCore import QPointF
+            from PySide6.QtGui import QPolygonF
 
-        cx = sz / 2
-        body = QPolygonF(
-            [
-                QPointF(cx, 1),
-                QPointF(sz - 2, sz * 0.38),
-                QPointF(cx, sz - 2),
-                QPointF(2, sz * 0.38),
-            ]
-        )
-        painter.setBrush(QColor("#eab308"))
-        painter.setPen(QPen(QColor("#0a0a0f"), max(1, sz // 12)))
-        painter.drawPolygon(body)
-        painter.setPen(QColor("#0a0a0f"))
-        font = QFont("Segoe UI", max(6, sz // 3))
-        font.setBold(True)
-        painter.setFont(font)
-        painter.drawText(0, 0, sz, sz, Qt.AlignmentFlag.AlignCenter, "Q")
+            cx = sz / 2
+            body = QPolygonF(
+                [
+                    QPointF(cx, 1),
+                    QPointF(sz - 2, sz * 0.38),
+                    QPointF(cx, sz - 2),
+                    QPointF(2, sz * 0.38),
+                ]
+            )
+            painter.setBrush(QColor("#eab308"))
+            painter.setPen(QPen(QColor("#0a0a0f"), max(1, sz // 12)))
+            painter.drawPolygon(body)
+            painter.setPen(QColor("#0a0a0f"))
+            font = QFont("Segoe UI", max(6, sz // 3))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(0, 0, sz, sz, Qt.AlignmentFlag.AlignCenter, initial)
         if requires_key:
-            badge = max(8, sz // 2)
-            painter.setBrush(QColor("#111827"))
-            painter.setPen(QPen(QColor("#fbbf24"), max(1, sz // 16)))
-            painter.drawEllipse(sz - badge - 1, 1, badge, badge)
-            painter.setPen(QColor("#fbbf24"))
-            kf = QFont("Segoe UI", max(5, badge // 2))
-            kf.setBold(True)
-            painter.setFont(kf)
-            painter.drawText(sz - badge - 1, 1, badge, badge, Qt.AlignmentFlag.AlignCenter, "K")
+            _draw_key_badge(painter, sz)
 
     pix = _draw_pixmap(size_i, draw)
     _ICON_CACHE[cache] = pix
