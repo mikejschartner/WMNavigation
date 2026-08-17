@@ -50,10 +50,11 @@ class FriendPing:
 class FriendSync:
     """MQTT room client. Callbacks fire from the network thread — marshal to UI."""
 
-    def __init__(self, player_id: str, on_update=None, on_status=None):
+    def __init__(self, player_id: str, on_update=None, on_status=None, on_join_result=None):
         self.player_id = player_id or new_player_id()
         self.on_update = on_update
         self.on_status = on_status
+        self.on_join_result = on_join_result
         self.room = ""
         self.name = "Operator"
         self.color = "#38bdf8"
@@ -62,6 +63,9 @@ class FriendSync:
         self._client: mqtt.Client | None = None
         self._connected = False
         self._last_pos: dict | None = None
+
+    def is_connected(self) -> bool:
+        return bool(self._connected and self.room)
 
     def friends_snapshot(self) -> dict[str, FriendPing]:
         now = time.time()
@@ -155,10 +159,20 @@ class FriendSync:
     def _on_connect(self, client, _userdata, _flags, rc):
         if int(rc) != 0:
             self._emit_status(f"Friend sync refused ({rc})")
+            if self.on_join_result:
+                try:
+                    self.on_join_result(False, self.room)
+                except Exception:
+                    pass
             return
         self._connected = True
         client.subscribe(f"{TOPIC_ROOT}/{self.room}/#", qos=0)
         self._emit_status(f"In room {self.room}")
+        if self.on_join_result:
+            try:
+                self.on_join_result(True, self.room)
+            except Exception:
+                pass
         if self._last_pos:
             self.publish_position(**self._last_pos)
 

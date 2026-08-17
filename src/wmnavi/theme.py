@@ -161,4 +161,14 @@ QFrame#sidebar QScrollArea#sidebarScroll {{
     min-height: 0;
     background: transparent;
 }}
+QStackedWidget {{
+    background-color: {BG};
+}}
+QLineEdit {{
+    background-color: rgba(255, 255, 255, 0.05);
+    border: 1px solid {BORDER};
+    border-radius: 8px;
+    padding: 6px 10px;
+    color: {TEXT};
+}}
 """

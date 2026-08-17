@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -53,7 +54,7 @@ from .route_planner import (
 )
 from .data_loader import get_interactive_map, list_map_names
 from .floors import FloorOption, build_floor_options, floor_for_y
-from .friend_sync import FriendSync, new_player_id
+from .friend_sync import FriendSync, new_player_id, normalize_room_code
 from .hotkeys import GlobalHotkeys
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
 from .item_filter_dialog import ItemFilterDialog
@@ -80,8 +81,13 @@ from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
 from .theme import STYLESHEET
 from .win_input import press_v_in_raid
+from .applog import get_logger
+from .visual.engine import VisualFilterEngine
+from .visual.toast import ProfileToast
+from .visual.ui import VisualProfilesPage
 
 COMPASS_YAW_DEG_PER_PX = 0.42
+log = get_logger("wmnavi.app")
 
 
 class ScreenshotHandler(FileSystemEventHandler):
@@ -122,6 +128,7 @@ class Bridge(QObject):
     quests_imported = Signal(object)
     friend_update = Signal(object)
     friend_status = Signal(str)
+    friend_joined = Signal(bool, str)
     route_ready = Signal(object)
 
 
@@ -146,6 +153,7 @@ class MainWindow(QMainWindow):
         self.bridge.quests_imported.connect(self.on_quests_imported)
         self.bridge.friend_update.connect(self.on_friend_update)
         self.bridge.friend_status.connect(self.on_friend_status)
+        self.bridge.friend_joined.connect(self.on_friend_joined, Qt.ConnectionType.QueuedConnection)
         self.bridge.route_ready.connect(self.on_route_ready)
 
         player_id = str(self.settings.value("friend_player_id", "") or "")
@@ -156,6 +164,7 @@ class MainWindow(QMainWindow):
             player_id,
             on_update=lambda snaps: self.bridge.friend_update.emit(snaps),
             on_status=lambda text: self.bridge.friend_status.emit(str(text)),
+            on_join_result=lambda ok, room: self.bridge.friend_joined.emit(bool(ok), str(room or "")),
         )
         self._friend_color = str(self.settings.value("friend_color", "#38bdf8") or "#38bdf8")
 
@@ -218,6 +227,14 @@ class MainWindow(QMainWindow):
         self._route_refresh_timer.setSingleShot(True)
         self._route_refresh_timer.timeout.connect(self._maybe_refresh_route)
 
+        self._auto_join_pending = False
+        self._auto_join_timer = QTimer(self)
+        self._auto_join_timer.setSingleShot(True)
+        self._auto_join_timer.timeout.connect(self._on_auto_join_timeout)
+        self.visual_engine = VisualFilterEngine(self)
+        self.visual_toast = ProfileToast()
+        self.visual_engine.status.connect(self._on_visual_status)
+
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
         # Create minimap lazily on first F7 — avoids extra startup work/crashes.
@@ -240,6 +257,7 @@ class MainWindow(QMainWindow):
         self.update_failed.connect(self._on_update_failed)
         self._friend_prune_timer.start()
         QTimer.singleShot(300, self._start_global_hotkeys)
+        QTimer.singleShot(800, self._maybe_auto_join_last_room)
         if not is_frozen():
             QTimer.singleShot(800, self.check_for_updates)
 
@@ -266,9 +284,33 @@ class MainWindow(QMainWindow):
         return f"layers/{self.current_game_mode}/{self.current_map_slug}"
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
+        shell = QWidget()
+        self.setCentralWidget(shell)
+        shell_layout = QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+
+        nav = QFrame()
+        nav.setObjectName("mapOverlay")
+        nav_row = QHBoxLayout(nav)
+        nav_row.setContentsMargins(10, 6, 10, 6)
+        self.btn_page_map = QPushButton("Map")
+        self.btn_page_visual = QPushButton("Visual Profiles")
+        self.btn_page_map.setCheckable(True)
+        self.btn_page_visual.setCheckable(True)
+        self.btn_page_map.setObjectName("sectionToggle")
+        self.btn_page_visual.setObjectName("sectionToggle")
+        self.btn_page_map.setChecked(True)
+        self.btn_page_map.clicked.connect(lambda: self._show_main_page(0))
+        self.btn_page_visual.clicked.connect(lambda: self._show_main_page(1))
+        nav_row.addWidget(self.btn_page_map)
+        nav_row.addWidget(self.btn_page_visual)
+        nav_row.addStretch(1)
+        shell_layout.addWidget(nav)
+
+        self.page_stack = QStackedWidget()
+        map_page = QWidget()
+        layout = QHBoxLayout(map_page)
         layout.setContentsMargins(0, 0, 0, 0)
 
         sidebar = QFrame()
@@ -352,6 +394,13 @@ class MainWindow(QMainWindow):
         self.friend_status_label.setObjectName("status")
         self.friend_status_label.setWordWrap(True)
         raid.body_layout.addWidget(self.friend_status_label)
+        self.chk_auto_join = QCheckBox("Auto Join Last Room")
+        self.chk_auto_join.setToolTip(
+            "On launch, rejoin the last room that connected successfully so friend pings start without joining again."
+        )
+        self.chk_auto_join.setChecked(self.settings.value("friend_auto_join", False, type=bool))
+        self.chk_auto_join.stateChanged.connect(self.on_auto_join_toggled)
+        raid.body_layout.addWidget(self.chk_auto_join)
 
         live_row = QHBoxLayout()
         self.chk_live = QCheckBox("Continuous mode")
@@ -624,11 +673,21 @@ class MainWindow(QMainWindow):
         splitter.splitterMoved.connect(self._keep_sidebar_open)
         QTimer.singleShot(0, self._keep_sidebar_open)
 
+        self.page_stack.addWidget(map_page)
+        self.visual_page = VisualProfilesPage(self.visual_engine, parent=self)
+        self.page_stack.addWidget(self.visual_page)
+        shell_layout.addWidget(self.page_stack, 1)
+
         self._set_mode_combo(self.current_game_mode)
         self.on_topmost()
         self._sync_live_timer()
         self._select_map_combo(self.current_map_slug)
         self._update_price_labels()
+
+    def _show_main_page(self, index: int):
+        self.page_stack.setCurrentIndex(int(index))
+        self.btn_page_map.setChecked(index == 0)
+        self.btn_page_visual.setChecked(index == 1)
 
     def _build_settings_widget(self):
         self.settings_widget = QWidget(self)
@@ -1372,6 +1431,12 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Mini map opacity {pct}%")
         elif key == "f9":
             self._toggle_compass()
+        elif key == "f10":
+            on = self.visual_engine.toggle_filter()
+            self.status_label.setText("Visual Filter ON (F10)" if on else "Visual Filter OFF (F10)")
+        elif key == "f11":
+            name = self.visual_engine.cycle_profile()
+            self.status_label.setText(f"Visual Profile: {name}")
 
     def on_marker_clicked(self, kind: str, point: object, item: ItemInfo | None):
         if kind == "quest" and isinstance(point, MapPoint):
@@ -1574,7 +1639,10 @@ class MainWindow(QMainWindow):
         self.settings.setValue("friend_color", self._friend_color)
         ok = self.friend_sync.join(room, name, self._friend_color)
         self.btn_friend_join.setEnabled(not ok)
-        if ok and self.friend_sync._last_pos:
+        if not ok:
+            log.info("Manual join failed before connect: %s", room)
+            return
+        if self.friend_sync._last_pos:
             self.friend_sync.publish_position(
                 **self.friend_sync._last_pos,
                 name=name,
@@ -1582,6 +1650,8 @@ class MainWindow(QMainWindow):
             )
 
     def leave_friend_room(self):
+        self._auto_join_pending = False
+        self._auto_join_timer.stop()
         self.friend_sync.leave()
         self.btn_friend_join.setEnabled(True)
         self.friend_status_label.setText("Not in a room")
@@ -1590,6 +1660,71 @@ class MainWindow(QMainWindow):
             self.minimap.map_view.set_friends([], self.current_map_slug)
         if self.compass is not None:
             self.compass.set_friends([], self.current_map_slug)
+
+    def on_auto_join_toggled(self):
+        self.settings.setValue("friend_auto_join", self.chk_auto_join.isChecked())
+
+    def _maybe_auto_join_last_room(self):
+        if not self.chk_auto_join.isChecked():
+            return
+        room = str(self.settings.value("friend_last_room", "") or "")
+        code = normalize_room_code(room)
+        if len(code) < 3:
+            return
+        log.info("Auto join attempted: %s", code)
+        self.friend_room_edit.setText(code)
+        name = self.friend_name_edit.text().strip() or "Operator"
+        self._auto_join_pending = True
+        ok = self.friend_sync.join(code, name, self._friend_color)
+        self.btn_friend_join.setEnabled(not ok)
+        if not ok:
+            self._auto_join_pending = False
+            log.info("Auto join failed")
+            log.info("Manual fallback")
+            self.friend_status_label.setText("Could not automatically join the previous room.")
+            self.btn_friend_join.setEnabled(True)
+            return
+        self._auto_join_timer.start(10000)
+
+    def _on_auto_join_timeout(self):
+        if not self._auto_join_pending:
+            return
+        self._auto_join_pending = False
+        if self.friend_sync.is_connected():
+            return
+        log.info("Auto join failed")
+        log.info("Manual fallback")
+        try:
+            self.friend_sync.leave()
+        except Exception:
+            pass
+        self.btn_friend_join.setEnabled(True)
+        self.friend_status_label.setText("Could not automatically join the previous room.")
+
+    @Slot(bool, str)
+    def on_friend_joined(self, ok: bool, room: str):
+        code = normalize_room_code(room)
+        if ok and len(code) >= 3:
+            self.settings.setValue("friend_last_room", code)
+            self.settings.setValue("friend_room", code)
+            log.info("Last room stored: %s", code)
+            if self._auto_join_pending:
+                self._auto_join_pending = False
+                self._auto_join_timer.stop()
+                log.info("Auto join successful: %s", code)
+            return
+        if self._auto_join_pending:
+            self._auto_join_pending = False
+            self._auto_join_timer.stop()
+            log.info("Auto join failed")
+            log.info("Manual fallback")
+            self.friend_status_label.setText("Could not automatically join the previous room.")
+            self.btn_friend_join.setEnabled(True)
+
+    def _on_visual_status(self, text: str):
+        if str(text).startswith("Visual Profile:"):
+            self.visual_toast.show_message(text)
+            self.status_label.setText(text)
 
     @Slot(object)
     def on_friend_update(self, snaps):
@@ -1779,6 +1914,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(800, lambda: self.import_quests_from_logs(silent=True))
 
     def closeEvent(self, event):
+        try:
+            self.visual_engine.shutdown()
+        except Exception:
+            pass
+        try:
+            self.visual_toast.hide()
+        except Exception:
+            pass
         try:
             self.motion.stop()
         except Exception:
@@ -2360,6 +2503,7 @@ def run():
         window = MainWindow()
         window.resize(1400, 900)
         window.setMinimumSize(720, 420)
+        app.aboutToQuit.connect(window.visual_engine.shutdown)
         window.show()
         sys.exit(app.exec())
     except Exception:

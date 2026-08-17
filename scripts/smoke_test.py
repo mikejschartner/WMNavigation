@@ -133,6 +133,39 @@ def main() -> int:
         art_rect = art.sceneBoundingRect()
         if art_rect.width() < rect.width() * 0.5 or art_rect.height() < rect.height() * 0.5:
             raise RuntimeError(f"F7 overlay map misplaced: art={art_rect} scene={rect}")
+        if not hasattr(window, "btn_page_visual") or not hasattr(window, "visual_page"):
+            raise RuntimeError("Visual Profiles tab missing")
+        if window.page_stack.count() < 2:
+            raise RuntimeError("Visual Profiles page missing")
+        if not hasattr(window, "chk_auto_join"):
+            raise RuntimeError("Auto Join Last Room missing")
+        from wmnavi.hotkeys import _KEYS
+        from wmnavi.visual.profiles import VisualProfileManager, VisualSettings
+        from wmnavi.visual.tone import build_gamma_ramp, identity_ramp
+
+        names = {name for _vk, name in _KEYS}
+        if "f10" not in names or "f11" not in names:
+            raise RuntimeError("F10/F11 hotkeys missing")
+        red, green, blue = build_gamma_ramp(VisualSettings())
+        ident = identity_ramp()[0]
+        if red != ident or green != ident or blue != ident:
+            raise RuntimeError("default visual LUT is not identity")
+        mgr = VisualProfileManager()
+        mgr.draft.gamma = 4.0
+        if mgr.save_draft_to_active() or mgr.profiles[0].settings.gamma != 1.0:
+            raise RuntimeError("Default visual profile must stay unmodified")
+        mgr.select(1)
+        mgr.draft.gamma = 4.0
+        if not mgr.save_draft_to_active() or mgr.profiles[1].settings.gamma != 4.0:
+            raise RuntimeError("Profile 1 session save failed")
+        leaked = [k for k in window.settings.allKeys() if "visual_profile" in str(k).lower()]
+        if leaked:
+            raise RuntimeError(f"Visual Profiles leaked into QSettings: {leaked}")
+        if window.visual_engine.manager.filter_enabled:
+            raise RuntimeError("Visual Filter must start OFF")
+        if window.visual_engine.manager.active_index != 0:
+            raise RuntimeError("Visual Profiles must start on Default")
+        window.visual_engine.shutdown()
         print(f"SMOKE OK v{__version__} title={title}")
         return 0
     except Exception:

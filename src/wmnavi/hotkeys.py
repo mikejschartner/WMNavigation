@@ -1,4 +1,4 @@
-"""Global F6–F9 detection via key-state polling (no Win32 hotkey thread/filter)."""
+"""Global F6–F11 detection via key-state polling (no Win32 hotkey thread/filter)."""
 
 from __future__ import annotations
 
@@ -12,14 +12,23 @@ VK_F6 = 0x75
 VK_F7 = 0x76
 VK_F8 = 0x77
 VK_F9 = 0x78
+VK_F10 = 0x79
+VK_F11 = 0x7A
 
-_KEYS = ((VK_F6, "f6"), (VK_F7, "f7"), (VK_F8, "f8"), (VK_F9, "f9"))
+_KEYS = (
+    (VK_F6, "f6"),
+    (VK_F7, "f7"),
+    (VK_F8, "f8"),
+    (VK_F9, "f9"),
+    (VK_F10, "f10"),
+    (VK_F11, "f11"),
+)
 
 
 class GlobalHotkeys(QObject):
-    """Poll F6–F9 so they work while Tarkov is focused, without RegisterHotKey."""
+    """Poll F6–F11 so they work while Tarkov is focused, without RegisterHotKey."""
 
-    pressed = Signal(str)  # "f6" | "f7" | "f8" | "f9"
+    pressed = Signal(str)  # "f6" .. "f11"
 
     def __init__(self, parent=None):
         super().__init__(parent)
