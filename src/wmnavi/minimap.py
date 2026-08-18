@@ -75,6 +75,8 @@ class MiniMapWindow(QWidget):
 
         self.map_view = MapView()
         self.map_view.set_prefer_raster_art(True)
+        self.map_view.setTransformationAnchor(self.map_view.ViewportAnchor.AnchorViewCenter)
+        self.map_view.setResizeAnchor(self.map_view.ViewportAnchor.AnchorViewCenter)
         self.map_view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.map_view.setInteractive(False)
         self.map_view.setDragMode(self.map_view.DragMode.NoDrag)

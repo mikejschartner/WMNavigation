@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
 )
 
 from .coords import PlayerState, crs_bounds_from_map, game_to_map
-from .heading import map_facing_deg
-from .floors import FloorOption, marker_on_floor
+from .heading import map_facing_deg, wrap_deg
+from .floors import FloorOption, HouseIndex, floor_number, keep_ground_map_art, marker_on_floor
 from .loot_filter import best_item_at_spot, filter_spots, spot_is_super_rare
 from .locks import door_locks, lock_key_name
 from .marker_icons import (
@@ -183,6 +183,10 @@ class MapView(QGraphicsView):
         self._haze_off_floor = True
         self._hide_locked_room_loot = False
         self._locked_loot_ids: set[str] = set()
+        self._houses: HouseIndex | None = None
+        self._player_game_xz: tuple[float, float] | None = None
+        self._heading_up_deg: float | None = None
+        self._applied_keep_ground = False
         self._marker_items: list[QGraphicsItem] = []
         self._friend_items: list[QGraphicsItem] = []
         self._route_items: list[QGraphicsItem] = []
@@ -254,14 +258,22 @@ class MapView(QGraphicsView):
     def _has_base_art(self) -> bool:
         return self.map_item is not None or self._tile_item is not None
 
+    def set_house_index(self, houses: HouseIndex | None):
+        self._houses = houses
+
+    def set_player_xz(self, x: float, z: float):
+        self._player_game_xz = (float(x), float(z))
+
+    def _keep_ground_art(self) -> bool:
+        xz = self._player_game_xz
+        if not xz:
+            return False
+        return keep_ground_map_art(self._floor, xz[0], xz[1])
+
     def set_floor(self, floor: FloorOption):
-        if (
-            floor == self._floor
-            and self._applied_floor_key == self._floor_cache_key()
-            and self._has_base_art()
-        ):
-            return
         self._floor = floor
+        if self._applied_floor_key == self._floor_cache_key() and self._has_base_art():
+            return
         self._apply_floor_visual()
         self.refresh_layers()
 
@@ -282,6 +294,9 @@ class MapView(QGraphicsView):
         self._map_slug = map_slug
         self._svg_source = svg_path
         self._applied_floor_key = ""
+        self._player_game_xz = None
+        self._heading_up_deg = None
+        self._applied_keep_ground = False
         # Never keep the previous map's floor (would overlay Streets tiles on Lighthouse).
         self._floor = FloorOption(
             "All Floors",
@@ -376,7 +391,8 @@ class MapView(QGraphicsView):
 
     def _floor_cache_key(self) -> str:
         floor = self._floor
-        return f"{self._map_slug}|{floor.label}|{floor.svg_layer}|{floor.kind}"
+        keep = int(self._keep_ground_art())
+        return f"{self._map_slug}|{floor.label}|{floor.svg_layer}|{floor.kind}|g{keep}"
 
     def _replace_svg_item(self, path: str):
         """Swap the SVG graphic without resetting pan/zoom."""
@@ -450,19 +466,29 @@ class MapView(QGraphicsView):
         floor = self._floor
         source = self._svg_source
         has_art = map_has_floor_art(self._map_meta)
+        keep_ground = self._keep_ground_art()
+        self._applied_keep_ground = keep_ground
+        if keep_ground:
+            svg_layer = str((self._map_meta or {}).get("svgLayer") or "")
+            tile_path = str((self._map_meta or {}).get("tilePath") or "")
+            kind = "main"
+        else:
+            svg_layer = floor.svg_layer
+            tile_path = floor.tile_path
+            kind = floor.kind
 
         if source and has_art:
             dest = (
                 cache_dir()
                 / "svg_floors"
-                / f"{self._map_slug}_{floor.kind}_{floor.svg_layer or 'ground'}.svg"
+                / f"{self._map_slug}_{kind}_{svg_layer or 'ground'}.svg"
             )
             ok = apply_svg_floor(
                 Path(source),
                 dest,
                 map_meta=self._map_meta,
-                active_layer=floor.svg_layer,
-                kind=floor.kind,
+                active_layer=svg_layer,
+                kind=kind,
             )
             if ok and dest.exists():
                 self._replace_svg_item(str(dest))
@@ -472,7 +498,7 @@ class MapView(QGraphicsView):
             self._replace_svg_item(source)
 
         if has_art:
-            self._set_floor_tiles(floor.tile_path or None)
+            self._set_floor_tiles(tile_path or None)
         elif self._floor_tile_item:
             self.scene.removeItem(self._floor_tile_item)
             self._floor_tile_item = None
@@ -552,10 +578,16 @@ class MapView(QGraphicsView):
         if not state:
             self.player.hide()
             return
+        self._player_game_xz = (float(state.x), float(state.z))
+        if self._floor_cache_key() != self._applied_floor_key:
+            self._apply_floor_visual()
         mx, my = game_to_map(state.x, state.z, self.map_rotation, self.map_transform)
-        facing = map_facing_deg(
-            state.x, state.z, state.yaw_deg, self.map_rotation, self.map_transform
-        )
+        if self._heading_up_deg is not None:
+            facing = 0.0
+        else:
+            facing = map_facing_deg(
+                state.x, state.z, state.yaw_deg, self.map_rotation, self.map_transform
+            )
         self.player.set_state(mx, my, facing, 0)
         self.player.show()
         self.player_updated.emit(state)
@@ -643,7 +675,7 @@ class MapView(QGraphicsView):
             mx, my = game_to_map(ping.x, ping.z, self.map_rotation, self.map_transform)
             if not self._in_map_bounds(mx, my):
                 continue
-            on_floor = self._on_active_floor(ping.y)
+            on_floor = self._on_active_floor(ping.y, ping.x, ping.z)
             opacity = 1.0 if on_floor else 0.35
             color = getattr(ping, "color", None) or "#38bdf8"
             pix = load_friend_marker_pixmap(self._px(28), color=color)
@@ -651,15 +683,16 @@ class MapView(QGraphicsView):
             marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
             marker.setOffset(-pix.width() / 2, -pix.height() / 2)
             marker.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
-            marker.setRotation(
-                map_facing_deg(
-                    ping.x,
-                    ping.z,
-                    float(getattr(ping, "yaw_deg", 0)),
-                    self.map_rotation,
-                    self.map_transform,
-                )
+            facing = map_facing_deg(
+                ping.x,
+                ping.z,
+                float(getattr(ping, "yaw_deg", 0)),
+                self.map_rotation,
+                self.map_transform,
             )
+            if self._heading_up_deg is not None:
+                facing = wrap_deg(facing - self._heading_up_deg)
+            marker.setRotation(facing)
             marker.setPos(mx, my)
             marker.setZValue(1900)
             marker.setOpacity(opacity)
@@ -682,9 +715,19 @@ class MapView(QGraphicsView):
             self.scene.addItem(text)
             self._friend_items.append(text)
 
-    def _on_active_floor(self, y: float) -> bool:
+    def _on_active_floor(self, y: float, x: float | None = None, z: float | None = None) -> bool:
         if self._floor.label.lower() == "all floors":
             return True
+        if x is not None and z is not None and self._houses is not None:
+            story = self._houses.loot_story(x, z, y)
+            if story is not None:
+                n = floor_number(self._floor)
+                if n == 1 or self._floor.kind == "main":
+                    return story == 1
+                if n == 2:
+                    return story == 2
+                if n is not None and n >= 3:
+                    return False
         return marker_on_floor(y, self._floor)
 
     def _scene_pos(self, point: MapPoint | LootSpot) -> tuple[float, float, float]:
@@ -704,7 +747,7 @@ class MapView(QGraphicsView):
         tooltip: str = "",
     ):
         mx, my, y = self._scene_pos(point)
-        on_floor = self._on_active_floor(y)
+        on_floor = self._on_active_floor(y, getattr(point, "x", None), getattr(point, "z", None))
         # Haze off-floor loot instead of hiding it (when a specific floor is active).
         if not on_floor and not self._haze_off_floor:
             return
@@ -989,11 +1032,17 @@ class MapView(QGraphicsView):
         if self.player.isVisible():
             self.centerOn(self.player)
 
-    def focus_around_player(self, fraction: float = 0.14, radius_m: float | None = None):
+    def focus_around_player(
+        self,
+        fraction: float = 0.14,
+        radius_m: float | None = None,
+        heading_up_deg: float | None = None,
+    ):
         """Center + zoom the overlay around the player.
 
         Prefer radius_m (game meters) so large maps still get a close overlay.
         Fraction is only used when the map has no transform scale.
+        heading_up_deg rotates so look direction is the top of the view.
         """
         if self.crs_bounds:
             min_x, max_x, min_y, max_y = self.crs_bounds
@@ -1031,4 +1080,8 @@ class MapView(QGraphicsView):
         self.resetTransform()
         self.fitInView(area, Qt.AspectRatioMode.KeepAspectRatio)
         self.centerOn(pos)
+        self._heading_up_deg = heading_up_deg
+        if heading_up_deg is not None:
+            # Qt rotate is clockwise; map facing 0 = north = top of the unrotated map.
+            self.rotate(-float(heading_up_deg))
         self.viewport().update()

@@ -41,7 +41,7 @@ from .loot_service import LootValueService
 from .compass import CompassHud
 from .coords import PlayerState
 from .extract_panel import ExtractAvailabilityPanel, unique_extracts
-from .heading import HeadingTracker
+from .heading import HeadingTracker, shortest_delta
 from .locks import locked_loot_ids as compute_locked_loot_ids
 from .nav_graph import NavGraph
 from .raid_time import remaining_seconds
@@ -53,7 +53,14 @@ from .route_planner import (
     should_refresh_route,
 )
 from .data_loader import get_interactive_map, list_map_names
-from .floors import FloorOption, build_floor_options, floor_for_player
+from .floors import (
+    FloorOption,
+    build_floor_options,
+    build_house_index,
+    floor_for_player,
+    loot_points_from_layers,
+    overlay_boxes_from_floors,
+)
 from .friend_sync import FriendSync, new_player_id, normalize_room_code
 from .hotkeys import GlobalHotkeys
 from .item_categories import CATEGORY_META, CATEGORY_ORDER, ids_for_categories
@@ -176,6 +183,7 @@ class MainWindow(QMainWindow):
         self.selected_item_ids: set[str] = set()
         self.floor_options: list[FloorOption] = [FloorOption("All Floors", -10000, 10000)]
         self._floor_vote_label: str | None = None
+        self._houses = None
         self.map_quests: list[QuestInfo] = []
         self.anywhere_quests: list[QuestInfo] = []
         self.active_quest_ids: set[str] = set()
@@ -213,6 +221,9 @@ class MainWindow(QMainWindow):
         self.compass = None
         self.motion = MotionTracker(self)
         self.motion.sample.connect(self._on_motion_sample, Qt.ConnectionType.QueuedConnection)
+        self._minimap_heading_timer = QTimer(self)
+        self._minimap_heading_timer.setInterval(16)
+        self._minimap_heading_timer.timeout.connect(self._on_minimap_heading_tick)
         self._tracking_debug = False
         self.loot = LootValueService(self)
         self.loot.updated.connect(self._on_loot_updated)
@@ -1255,12 +1266,16 @@ class MainWindow(QMainWindow):
         return spots
 
     def _select_floor_for_player(self, state: PlayerState):
+        self.map_view.set_player_xz(state.x, state.z)
+        if self._minimap_ok():
+            self.minimap.map_view.set_player_xz(state.x, state.z)
         match = floor_for_player(
             state.x,
             state.z,
             state.y,
             self.floor_options,
             self.map_view._map_meta,
+            houses=self._houses,
         )
         if not match:
             return
@@ -1268,12 +1283,15 @@ class MainWindow(QMainWindow):
             idx = self.floor_options.index(match)
         except ValueError:
             return
-        if self.floor_combo.currentIndex() == idx:
+        current_idx = self.floor_combo.currentIndex()
+        if current_idx == idx:
             self._floor_vote_label = match.label
             return
-        if self._floor_vote_label != match.label:
+        from_all = current_idx == 0
+        if not from_all and self._floor_vote_label != match.label:
             self._floor_vote_label = match.label
             return
+        self._floor_vote_label = match.label
         self.floor_combo.blockSignals(True)
         self.floor_combo.setCurrentIndex(idx)
         self.floor_combo.blockSignals(False)
@@ -1333,6 +1351,7 @@ class MainWindow(QMainWindow):
             map_slug=src._map_slug,
         )
         mm.set_layer_data(self.layer_data)
+        mm.set_house_index(self._houses)
         mm.set_floor(src._floor)
         mm.set_marker_scale(self._minimap_marker_scale())
         mm.apply_layer_state(
@@ -1376,20 +1395,34 @@ class MainWindow(QMainWindow):
         return max(0.004, 0.22 * (0.83 ** (level - 1)))
 
     def _refocus_minimap_view(self, view, *, force_zoom: bool = False) -> None:
+        heading_up = self.heading.heading if self.heading.has_heading else None
         zoom_key = (
             int(self.minimap_zoom.value()) if hasattr(self, "minimap_zoom") else 0,
             int(getattr(self, "minimap_size", None).value()) if hasattr(self, "minimap_size") else 0,
             id(view),
         )
         last = getattr(self, "_minimap_zoom_key", None)
+        prev_heading = getattr(view, "_heading_up_deg", None)
         if not force_zoom and last == zoom_key and view.player.isVisible():
-            view.centerOn(view.player)
-            return
+            if heading_up is None and prev_heading is None:
+                view.centerOn(view.player)
+                return
+            if (
+                heading_up is not None
+                and prev_heading is not None
+                and abs(shortest_delta(prev_heading, heading_up)) < 1.25
+            ):
+                view.centerOn(view.player)
+                return
         self._minimap_zoom_key = zoom_key
         view.focus_around_player(
             self._minimap_focus_fraction(),
             radius_m=self._minimap_radius_m(),
+            heading_up_deg=heading_up,
         )
+        if self._last_player:
+            view.set_player(self._last_player)
+        view._redraw_friends()
 
     def _update_minimap_zoom_label(self):
         level = int(self.minimap_zoom.value())
@@ -1430,9 +1463,14 @@ class MainWindow(QMainWindow):
             if visible:
                 self._sync_minimap_map()
                 self._refocus_minimap(force_zoom=True)
+                self._sync_motion_tracker()
+                if not self._minimap_heading_timer.isActive():
+                    self._minimap_heading_timer.start()
                 pct = int(self.minimap.opacity_tier() * 100)
                 self.status_label.setText(f"Mini map on · {pct}% opacity (F8 to cycle)")
             else:
+                self._minimap_heading_timer.stop()
+                self._sync_motion_tracker()
                 self.status_label.setText("Mini map off (F7)")
         elif key == "f8":
             if not self._minimap_ok() or not self.minimap.isVisible():
@@ -1939,6 +1977,7 @@ class MainWindow(QMainWindow):
             pass
         self._screenshot_poll.stop()
         self._live_timer.stop()
+        self._minimap_heading_timer.stop()
         self._friend_prune_timer.stop()
         self._route_refresh_timer.stop()
         try:
@@ -2128,11 +2167,25 @@ class MainWindow(QMainWindow):
     def _compass_on(self) -> bool:
         return self.compass is not None and self.compass.isVisible()
 
+    def _minimap_visible(self) -> bool:
+        return self._minimap_ok() and self.minimap.isVisible()
+
+    def _heading_live(self) -> bool:
+        return self._compass_on() or self._minimap_visible()
+
     def _sync_motion_tracker(self):
-        if self._compass_on():
+        if self._heading_live():
             self.motion.start()
         else:
             self.motion.stop()
+
+    def _on_minimap_heading_tick(self):
+        if not self._minimap_visible():
+            self._minimap_heading_timer.stop()
+            return
+        if not self._compass_on():
+            self.heading.tick()
+        self._refocus_minimap()
 
     def on_loot_value_toggled(self, on: bool):
         self._loot_value_on = bool(on)
@@ -2177,7 +2230,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_motion_sample(self, sample):
-        if not self._compass_on():
+        if not self._heading_live():
             return
         yaw_delta = -float(getattr(sample, "yaw_flow_px", 0.0)) * COMPASS_YAW_DEG_PER_PX
         self.heading.apply_visual_yaw(yaw_delta, float(getattr(sample, "feature_conf", 0.0)))
@@ -2395,6 +2448,13 @@ class MainWindow(QMainWindow):
         self._route_kind = None
         self.floor_options = build_floor_options(meta)
         self._floor_vote_label = None
+        if slug == "shoreline":
+            self._houses = build_house_index(
+                loot_points_from_layers(self.layer_data),
+                overlay_boxes_from_floors(self.floor_options),
+            )
+        else:
+            self._houses = None
         self.floor_combo.blockSignals(True)
         self.floor_combo.clear()
         for floor in self.floor_options:
@@ -2411,6 +2471,7 @@ class MainWindow(QMainWindow):
             map_slug=slug,
         )
         self.map_view.set_floor(self.floor_options[0])
+        self.map_view.set_house_index(self._houses)
         self.map_view.set_layer_data(self.layer_data)
 
         prefix = self._layer_settings_prefix()

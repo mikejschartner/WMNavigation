@@ -121,7 +121,10 @@ def main() -> int:
         rect = mv.scene.sceneRect()
         if rect.width() < 40 or rect.height() < 40:
             raise RuntimeError(f"map scene empty: {rect}")
+        from PySide6.QtWidgets import QGraphicsView
+
         from wmnavi.map_view import MapView
+        from wmnavi.minimap import MiniMapWindow
 
         overlay = MapView()
         overlay.set_prefer_raster_art(True)
@@ -171,6 +174,11 @@ def main() -> int:
             raise RuntimeError("Visual Filter must start OFF")
         if window.visual_engine.manager.active_index != 0:
             raise RuntimeError("Visual Profiles must start on Default")
+        mmw = MiniMapWindow(size_px=180)
+        center = QGraphicsView.ViewportAnchor.AnchorViewCenter
+        if mmw.map_view.transformationAnchor() != center or mmw.map_view.resizeAnchor() != center:
+            raise RuntimeError("F7 overlay must rotate around view center")
+        mmw.close()
         window.visual_engine.shutdown()
         print(f"SMOKE OK v{__version__} title={title}")
         return 0
