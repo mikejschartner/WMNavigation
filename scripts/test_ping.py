@@ -180,10 +180,12 @@ def test_expire_drops_old_ping():
 
 
 def test_shoreline_uses_unity_levels():
-    from wmnavi.geometry_import import MAP_LEVELS
+    from wmnavi.geometry_import import MAP_LEVELS, unity_typetree_error
 
     assert 25 in MAP_LEVELS["shoreline"]
     assert 17 in MAP_LEVELS["customs"]
+    err = unity_typetree_error()
+    assert err is None, err
 
 
 def main() -> int:

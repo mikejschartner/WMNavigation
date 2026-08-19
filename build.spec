@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 root = Path(SPECPATH)
 winrt_datas, winrt_binaries, winrt_hidden = collect_all("winrt")
@@ -15,6 +15,8 @@ a = Analysis(
         (str(root / "data" / "maps.json"), "data"),
         (str(root / "data" / "questie"), "data/questie"),
         *winrt_datas,
+        *collect_data_files("UnityPy"),
+        *collect_data_files("tpk_ar"),
     ],
     hiddenimports=[
         "PySide6.QtSvg",
@@ -31,6 +33,7 @@ a = Analysis(
         "brotli",
         "astc_encoder_py",
         "tpk_ar",
+        "UnityPy.resources",
         *collect_submodules("UnityPy"),
         *collect_submodules("winrt"),
         *winrt_hidden,

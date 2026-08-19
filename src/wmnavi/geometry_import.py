@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,8 @@ MAP_LEVELS: dict[str, tuple[int, ...]] = {
 
 _SKIP_WALK = ("acoustics", "audiobake", "audio", "pocketmap")
 _SKIP_SUFFIX = {".xrageo", ".xramap", ".dll", ".exe", ".txt", ".xml", ".json", ".manifest", ".resource"}
+_TERRAIN_IDS = {154}
+_MESH_IDS = {64, 65}
 
 
 def default_eft_data_dirs() -> list[Path]:
@@ -147,6 +150,80 @@ def _file_hash(path: Path, limit: int = 2_000_000) -> str:
     return digest.hexdigest()
 
 
+def _frozen_tpk_paths() -> list[Path]:
+    paths: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        paths.append(Path(meipass) / "UnityPy" / "resources" / "lzma.tpk")
+    try:
+        import UnityPy
+
+        paths.append(Path(UnityPy.__file__).resolve().parent / "resources" / "lzma.tpk")
+    except Exception:
+        pass
+    return paths
+
+
+def unity_typetree_error() -> str | None:
+    """None if UnityPy can parse Unity objects. Frozen exe needs lzma.tpk packed."""
+    try:
+        from UnityPy.helpers.Tpk import get_typetree
+
+        get_typetree()
+        return None
+    except Exception as exc:
+        tpk_path = next((p for p in _frozen_tpk_paths() if p.is_file()), None)
+        if tpk_path is None:
+            return f"Unity type trees missing ({exc})"
+        try:
+            from functools import cache
+            from io import BytesIO
+
+            import UnityPy.helpers.Tpk as tpk_mod
+            from tpk_ar import TpkFile, TpkTypeTreeBlob
+
+            raw = tpk_path.read_bytes()
+
+            @cache
+            def _get_typetree():
+                with BytesIO(raw) as stream:
+                    tree = TpkFile.parse(stream).GetDataBlob()
+                if not isinstance(tree, TpkTypeTreeBlob):
+                    raise TypeError("lzma.tpk is not a type tree")
+                return tree
+
+            tpk_mod.get_typetree = _get_typetree
+            _get_typetree()
+            log.info("Loaded Unity type trees from %s", tpk_path)
+            return None
+        except Exception as exc2:
+            return f"Unity type trees missing ({exc2})"
+
+
+def _object_kind(obj) -> tuple[str, int]:
+    cid = 0
+    try:
+        cid = int(getattr(obj, "class_id", 0) or 0)
+    except Exception:
+        cid = 0
+    if not cid:
+        try:
+            cid = int(getattr(getattr(obj, "type", None), "value", 0) or 0)
+        except Exception:
+            cid = 0
+    kind = ""
+    try:
+        kind = str(getattr(getattr(obj, "type", None), "name", "") or "")
+    except Exception:
+        kind = ""
+    if not kind:
+        if cid in _TERRAIN_IDS:
+            kind = "TerrainCollider"
+        elif cid in _MESH_IDS:
+            kind = "MeshCollider" if cid == 64 else "BoxCollider"
+    return kind, cid
+
+
 def candidate_files(data_dir: Path, slug: str) -> list[Path]:
     """Unity levelN scene files for this map. Not acoustic .xrageo / pocket maps."""
     hits: list[Path] = []
@@ -176,10 +253,15 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
         from UnityPy.helpers.MeshHelper import MeshHandler
     except Exception:
         return None, "UnityPy is not installed. Install it to import map collision."
+    tpk_err = unity_typetree_error()
+    if tpk_err:
+        log.warning("%s", tpk_err)
+        return None, tpk_err
 
     height_slices: list[tuple[float, float, float, np.ndarray]] = []
     mesh_groups: list[np.ndarray] = []
     scanned = 0
+    first_read_err = ""
     for path in files:
         scanned += 1
         status(f"Reading Unity {path.name} ({scanned}/{len(files)})")
@@ -191,29 +273,33 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
                 if loader:
                     try:
                         loader()
-                    except Exception:
-                        pass
-        except Exception:
+                    except Exception as exc:
+                        log.debug("load_dependencies %s: %s", path.name, exc)
+        except Exception as exc:
+            log.warning("Failed to open Unity %s: %s", path.name, exc)
             continue
         try:
             objects = list(env.objects)
-        except Exception:
+        except Exception as exc:
+            log.warning("Failed to list objects in %s: %s", path.name, exc)
             continue
         terrain_objs = []
         collider_objs = []
         for obj in objects:
-            try:
-                kind = str(getattr(getattr(obj, "type", None), "name", "") or "")
-            except Exception:
-                continue
-            if kind == "TerrainCollider":
+            kind, cid = _object_kind(obj)
+            if kind == "TerrainCollider" or cid in _TERRAIN_IDS:
                 terrain_objs.append(obj)
-            elif kind in {"MeshCollider", "BoxCollider"}:
-                collider_objs.append((kind, obj))
+            elif kind in {"MeshCollider", "BoxCollider"} or cid in _MESH_IDS:
+                collider_objs.append((kind or "MeshCollider", obj))
+        got_t = 0
+        got_m = 0
         for obj in terrain_objs:
             parsed = _read_terrain_collider(obj)
             if parsed is not None:
                 height_slices.append(parsed)
+                got_t += 1
+            elif not first_read_err:
+                first_read_err = _first_read_error(obj, "TerrainCollider")
         for kind, obj in collider_objs:
             if kind == "MeshCollider":
                 tris = _read_mesh_collider(obj, MeshHandler)
@@ -221,8 +307,23 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
                 tris = _read_box_collider(obj)
             if tris is not None and len(tris):
                 mesh_groups.append(tris)
+                got_m += 1
+            elif not first_read_err:
+                first_read_err = _first_read_error(obj, kind)
             if len(mesh_groups) > 8000:
                 break
+        log.info(
+            "%s: %d objects, TerrainCollider %d/%d, Mesh/Box %d/%d",
+            path.name,
+            len(objects),
+            got_t,
+            len(terrain_objs),
+            got_m,
+            len(collider_objs),
+        )
+
+    if first_read_err:
+        log.warning("Unity read error: %s", first_read_err)
 
     world = CollisionWorld(slug=slug, source="local tarkov colliders")
     merged = _merge_height_slices(height_slices)
@@ -237,7 +338,8 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
         world.tris = packed
         world.nodes = nodes
     if not world.ready():
-        return None, f"No terrain or colliders found in Unity scenes for {slug}."
+        extra = f" {first_read_err}" if first_read_err else ""
+        return None, f"No terrain or colliders found in Unity scenes for {slug}.{extra}"
     hashes = [_file_hash(p) for p in files[:12]]
     save_collision(
         world,
@@ -246,6 +348,14 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
     )
     status(f"Saved collision for {slug}")
     return world, "ok"
+
+
+def _first_read_error(obj, kind: str) -> str:
+    try:
+        obj.read()
+        return ""
+    except Exception as exc:
+        return f"{kind} read failed: {exc}"
 
 
 def _ptr_read(ptr):

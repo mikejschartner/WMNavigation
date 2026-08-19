@@ -179,6 +179,11 @@ def main() -> int:
         leaked = [k for k in window.settings.allKeys() if "visual_profile" in str(k).lower()]
         if leaked:
             raise RuntimeError(f"Visual Profiles leaked into QSettings: {leaked}")
+        from wmnavi.geometry_import import unity_typetree_error
+
+        tpk_err = unity_typetree_error()
+        if tpk_err:
+            raise RuntimeError(tpk_err)
         mmw = MiniMapWindow(size_px=180)
         center = QGraphicsView.ViewportAnchor.AnchorViewCenter
         if mmw.map_view.transformationAnchor() != center or mmw.map_view.resizeAnchor() != center:

@@ -1696,14 +1696,36 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Importing collision…")
 
         def work():
+            last_slug = slugs[-1]
             last_ok = False
             last_msg = ""
-            for slug in slugs:
-                self.bridge.import_status.emit(f"Importing {slug}…")
-                _world, msg = import_map(slug, data_dir, on_status=lambda t: self.bridge.import_status.emit(t))
-                last_ok = msg == "ok"
-                last_msg = msg if msg != "ok" else f"Imported {slug}"
-            self.bridge.import_done.emit(slugs[-1], last_ok, last_msg)
+            ok_slugs: list[str] = []
+            failed: list[str] = []
+            try:
+                for slug in slugs:
+                    last_slug = slug
+                    self.bridge.import_status.emit(f"Importing {slug}…")
+                    _world, msg = import_map(slug, data_dir, on_status=lambda t: self.bridge.import_status.emit(t))
+                    if msg == "ok":
+                        ok_slugs.append(slug)
+                        last_ok = True
+                        last_msg = f"Imported {slug}"
+                    else:
+                        failed.append(f"{slug}: {msg}")
+                        last_ok = False
+                        last_msg = msg
+                if len(slugs) > 1:
+                    if failed:
+                        last_ok = False
+                        last_msg = f"Imported {len(ok_slugs)}/{len(slugs)}. {failed[-1]}"
+                    else:
+                        last_ok = True
+                        last_msg = f"Imported {len(ok_slugs)} maps"
+            except Exception as exc:
+                log.exception("collision import crashed")
+                last_ok = False
+                last_msg = f"Import crashed: {exc}"
+            self.bridge.import_done.emit(last_slug, last_ok, last_msg)
 
         threading.Thread(target=work, name="wmnavi-geom", daemon=True).start()
 
