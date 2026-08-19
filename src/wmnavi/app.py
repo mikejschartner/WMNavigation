@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QLockFile, QObject, QSettings, QTimer, Qt, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QIcon
+from PySide6.QtGui import QAction, QColor, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -85,6 +85,7 @@ from .quest_log_sync import (
 )
 from .quest_panel import QuestListPanel
 from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_screenshot
+from .brand import app_icon, icon_png_path
 from .theme import STYLESHEET
 from .win_input import press_v_in_raid
 from .applog import get_logger
@@ -154,9 +155,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"WMNavigation v{__version__}")
         self.setMinimumSize(720, 420)
-        icon_path = app_root() / "assets" / "icon.png"
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        self._window_glow = None
+        icon = app_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.settings = QSettings("WMMods", "WMNavigation")
         self.bridge = Bridge()
         self.bridge.map_changed.connect(self.on_auto_map)
@@ -334,6 +336,18 @@ class MainWindow(QMainWindow):
         side_layout.setSpacing(6)
 
         header = QHBoxLayout()
+        logo = QLabel()
+        logo_pix = QPixmap(str(icon_png_path()))
+        if not logo_pix.isNull():
+            logo.setPixmap(
+                logo_pix.scaled(
+                    28,
+                    28,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+        header.addWidget(logo)
         title = QLabel("WMNavigation")
         title.setObjectName("title")
         header.addWidget(title, 1)
@@ -794,6 +808,12 @@ class MainWindow(QMainWindow):
         self.chk_topmost.setChecked(self.settings.value("always_on_top", True, type=bool))
         self.chk_topmost.stateChanged.connect(self.on_topmost)
         layout.addWidget(self.chk_topmost)
+
+        self.chk_window_glow = QCheckBox("Eerie window glow")
+        self.chk_window_glow.setToolTip("Slow purple pulse around the outside of the window.")
+        self.chk_window_glow.setChecked(self.settings.value("window_glow", True, type=bool))
+        self.chk_window_glow.stateChanged.connect(self.on_window_glow_toggled)
+        layout.addWidget(self.chk_window_glow)
 
         self.chk_autodelete = QCheckBox("Auto-delete raid screenshots")
         self.chk_autodelete.setChecked(self.auto_delete)
@@ -2474,6 +2494,12 @@ class MainWindow(QMainWindow):
             self.log_watcher.stop()
         if hasattr(self, "quest_log_watcher"):
             self.quest_log_watcher.stop()
+        try:
+            if self._window_glow is not None:
+                self._window_glow.shutdown()
+                self._window_glow = None
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def on_map_combo(self, label: str):
@@ -2490,6 +2516,34 @@ class MainWindow(QMainWindow):
         else:
             self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
         self.show()
+        if self._window_glow is not None:
+            self._window_glow.attach()
+
+    def on_window_glow_toggled(self):
+        on = self.chk_window_glow.isChecked()
+        self.settings.setValue("window_glow", on)
+        if self._window_glow is not None:
+            self._window_glow.set_enabled(on)
+        elif on:
+            self._ensure_window_glow()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._ensure_window_glow()
+
+    def _ensure_window_glow(self):
+        from .window_glow import WindowGlow, glow_supported
+
+        if not glow_supported():
+            return
+        if not self.chk_window_glow.isChecked():
+            if self._window_glow is not None:
+                self._window_glow.set_enabled(False)
+            return
+        if self._window_glow is None:
+            self._window_glow = WindowGlow(self)
+        self._window_glow.set_enabled(True)
+        self._window_glow.attach()
 
     def on_autodelete_toggle(self):
         self.auto_delete = self.chk_autodelete.isChecked()
@@ -2999,6 +3053,7 @@ class MainWindow(QMainWindow):
 
 def run():
     import faulthandler
+    import os
     import traceback
     from pathlib import Path
 
@@ -3025,8 +3080,15 @@ def run():
             pass
 
     try:
+        from .brand import app_icon, apply_windows_app_id
+        from .splash import SplashScreen
+
+        apply_windows_app_id()
         app = QApplication(sys.argv)
         app.setApplicationName("WMNavigation")
+        icon = app_icon()
+        if not icon.isNull():
+            app.setWindowIcon(icon)
         app.setStyleSheet(STYLESHEET)
 
         from .updater import cleanup_old_binaries
@@ -3038,16 +3100,30 @@ def run():
         app._wmnavi_lock = lock
         cleanup_old_binaries()
 
+        splash = None
+        platform = os.environ.get("QT_QPA_PLATFORM", "").lower()
+        if platform not in {"offscreen", "minimal"}:
+            splash = SplashScreen()
+            splash.show_centered()
+            splash.set_status("Loading map…")
+
         if is_frozen():
             from .update_ui import offer_startup_update
 
             if offer_startup_update(app):
+                if splash is not None:
+                    splash.close()
                 return
 
+        if splash is not None:
+            splash.set_status("Opening window…")
         window = MainWindow()
         window.resize(1400, 900)
         window.setMinimumSize(720, 420)
-        window.show()
+        if splash is not None:
+            splash.finish(window)
+        else:
+            window.show()
         sys.exit(app.exec())
     except Exception:
         _log_crash(traceback.format_exc())

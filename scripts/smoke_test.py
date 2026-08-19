@@ -117,6 +117,27 @@ def main() -> int:
             raise RuntimeError("Sync quests button missing")
         if not hasattr(window.layer_sidebar, "apply_preset"):
             raise RuntimeError("layer sidebar apply_preset missing")
+        from wmnavi.brand import app_icon, icon_ico_path, icon_png_path
+        from wmnavi.splash import SplashScreen
+        from wmnavi.theme import BG
+        from wmnavi.window_glow import glow_supported
+
+        if BG.lower() != "#050508":
+            raise RuntimeError("black-heavy theme missing")
+        if not icon_png_path().exists() or not icon_ico_path().exists():
+            raise RuntimeError("app logo missing")
+        icon = app_icon()
+        if icon.isNull():
+            raise RuntimeError("app icon failed")
+        splash = SplashScreen(min_ms=0)
+        splash.close()
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen" and glow_supported():
+            raise RuntimeError("window glow should stay off during offscreen smoke")
+        if not hasattr(window, "chk_window_glow"):
+            raise RuntimeError("window glow setting missing")
+        if not hasattr(window, "_window_glow"):
+            raise RuntimeError("window glow hook missing")
+
         traders = app_root() / "assets" / "traders"
         needed = [
             "prapor.jpg",
