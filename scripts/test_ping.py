@@ -179,6 +179,13 @@ def test_expire_drops_old_ping():
     assert mgr.active("customs") == []
 
 
+def test_shoreline_uses_unity_levels():
+    from wmnavi.geometry_import import MAP_LEVELS
+
+    assert 25 in MAP_LEVELS["shoreline"]
+    assert 17 in MAP_LEVELS["customs"]
+
+
 def main() -> int:
     test_synthetic_wall_hill_building_miss()
     test_collision_roundtrip()
@@ -189,6 +196,7 @@ def main() -> int:
     test_raid_reset_clears()
     test_ping_distance()
     test_expire_drops_old_ping()
+    test_shoreline_uses_unity_levels()
     print("PING TESTS OK")
     return 0
 

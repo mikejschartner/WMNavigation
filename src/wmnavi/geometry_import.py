@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 
 import numpy as np
@@ -13,24 +12,24 @@ from .map_geometry import CollisionWorld, HeightField, box_triangles, build_bvh,
 
 log = get_logger("wmnavi.geometry")
 
-# WMNav slug -> filename tokens in EscapeFromTarkov_Data.
-MAP_TOKENS: dict[str, tuple[str, ...]] = {
-    "customs": ("bigmap", "customs"),
-    "factory": ("factory4", "factory"),
-    "woods": ("woods",),
-    "shoreline": ("shoreline",),
-    "interchange": ("interchange",),
-    "reserve": ("rezervbase", "rezerv", "reserve"),
-    "lighthouse": ("lighthouse",),
-    "streets-of-tarkov": ("tarkovstreets", "city_streets"),
-    "the-lab": ("laboratory",),
-    "ground-zero": ("sandbox",),
-    "the-labyrinth": ("labyrinth",),
-    "terminal": ("terminal",),
-    "icebreaker": ("icebreaker",),
+# Unity scene files (levelN in EscapeFromTarkov_Data). Terrain first.
+# Sound / light / culling / AI / scripts are omitted.
+MAP_LEVELS: dict[str, tuple[int, ...]] = {
+    "customs": (17, 5, 6, 7, 9, 10, 11, 12, 16, 18, 20, 21, 22, 170, 171, 172, 173, 174, 175, 176),
+    "factory": (527, 528, 529, 530, 531, 532, 533, 534),
+    "woods": (165, 43),
+    "shoreline": (25, 23, 26, 28, 30, 32, 33, 34, 35, 36, 37, 39, 40),
+    "interchange": (63, 54, 55, 56, 57, 58, 59, 60, 61, 62, 65),
+    "reserve": (140, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 137, 138, 141, 142, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 168, 169),
+    "lighthouse": (200, 183, 186, 187, 188, 190, 192, 193, 194, 195, 197, 198, 199, 201, 202, 203, 204, 205, 206, 207, 208),
+    "streets-of-tarkov": tuple(n for n in range(214, 366) if n not in {211, 212, 213}),
+    "the-lab": tuple(range(71, 113)),
+    "ground-zero": tuple(range(466, 491)),
+    "the-labyrinth": (545, 546, 547, 548, 549, 550),
 }
 
-_SKIP_SUFFIX = {".dll", ".exe", ".txt", ".xml", ".json", ".manifest", ".resource"}
+_SKIP_WALK = ("acoustics", "audiobake", "audio", "pocketmap")
+_SKIP_SUFFIX = {".xrageo", ".xramap", ".dll", ".exe", ".txt", ".xml", ".json", ".manifest", ".resource"}
 
 
 def default_eft_data_dirs() -> list[Path]:
@@ -101,11 +100,11 @@ def eft_is_running() -> bool:
 
         if find_eft_window():
             return True
-        # Launcher may hold files without the game window.
         kernel32 = ctypes.windll.kernel32
         snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
         if snapshot == -1:
             return False
+
         class PROCESSENTRY32(ctypes.Structure):
             _fields_ = [
                 ("dwSize", ctypes.c_ulong),
@@ -149,35 +148,18 @@ def _file_hash(path: Path, limit: int = 2_000_000) -> str:
 
 
 def candidate_files(data_dir: Path, slug: str) -> list[Path]:
-    tokens = MAP_TOKENS.get(slug) or (slug.replace("-", ""),)
+    """Unity levelN scene files for this map. Not acoustic .xrageo / pocket maps."""
     hits: list[Path] = []
-    if not data_dir.is_dir():
-        return hits
-    search_roots = [data_dir]
-    streaming = data_dir / "StreamingAssets"
-    if streaming.is_dir():
-        search_roots.append(streaming)
-    for root in search_roots:
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for name in filenames:
-                lower = name.lower()
-                suffix = Path(name).suffix.lower()
-                if suffix in _SKIP_SUFFIX:
-                    continue
-                if not any(token in lower for token in tokens):
-                    continue
-                path = Path(dirpath) / name
-                if path.stat().st_size < 64:
-                    continue
-                hits.append(path)
-            # Do not walk the entire install forever.
-            if len(hits) > 80:
-                return hits
+    for num in MAP_LEVELS.get(slug) or ():
+        path = data_dir / f"level{int(num)}"
+        if path.is_file() and path.stat().st_size > 64:
+            hits.append(path)
     return hits
 
 
 def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorld | None, str]:
     """Build collision.bin for one map. Caller must ensure Tarkov is closed."""
+
     def status(text: str):
         log.info("%s", text)
         if on_status:
@@ -188,130 +170,283 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
 
     files = candidate_files(data_dir, slug)
     if not files:
-        return None, f"No game files matched {slug}. Check the Tarkov Data folder."
+        return None, f"No Unity scene files for {slug}. Check the Tarkov Data folder."
     try:
-        import UnityPy
+        from UnityPy.environment import Environment
+        from UnityPy.helpers.MeshHelper import MeshHandler
     except Exception:
         return None, "UnityPy is not installed. Install it to import map collision."
 
-    heights: list[tuple[float, float, float, np.ndarray]] = []
+    height_slices: list[tuple[float, float, float, np.ndarray]] = []
     mesh_groups: list[np.ndarray] = []
     scanned = 0
     for path in files:
         scanned += 1
-        if scanned % 8 == 1:
-            status(f"Reading {path.name} ({scanned}/{len(files)})")
+        status(f"Reading Unity {path.name} ({scanned}/{len(files)})")
         try:
-            env = UnityPy.load(str(path))
+            env = Environment(path=str(data_dir))
+            env.load_file(str(path))
+            for asset in list(env.files.values()):
+                loader = getattr(asset, "load_dependencies", None)
+                if loader:
+                    try:
+                        loader()
+                    except Exception:
+                        pass
         except Exception:
             continue
-        for obj in getattr(env, "objects", []) or []:
+        try:
+            objects = list(env.objects)
+        except Exception:
+            continue
+        terrain_objs = []
+        collider_objs = []
+        for obj in objects:
             try:
                 kind = str(getattr(getattr(obj, "type", None), "name", "") or "")
             except Exception:
                 continue
-            if kind == "TerrainData":
-                parsed = _read_terrain(obj)
-                if parsed is not None:
-                    heights.append(parsed)
+            if kind == "TerrainCollider":
+                terrain_objs.append(obj)
             elif kind in {"MeshCollider", "BoxCollider"}:
-                tris = _read_collider(obj, kind)
-                if tris is not None and len(tris):
-                    mesh_groups.append(tris)
-            if len(mesh_groups) > 4000:
+                collider_objs.append((kind, obj))
+        for obj in terrain_objs:
+            parsed = _read_terrain_collider(obj)
+            if parsed is not None:
+                height_slices.append(parsed)
+        for kind, obj in collider_objs:
+            if kind == "MeshCollider":
+                tris = _read_mesh_collider(obj, MeshHandler)
+            else:
+                tris = _read_box_collider(obj)
+            if tris is not None and len(tris):
+                mesh_groups.append(tris)
+            if len(mesh_groups) > 8000:
                 break
 
     world = CollisionWorld(slug=slug, source="local tarkov colliders")
-    if heights:
-        origin_x, origin_z, cell, grid = heights[0]
-        world.height = HeightField(origin_x, origin_z, cell, grid)
+    merged = _merge_height_slices(height_slices)
+    if merged is not None:
+        world.height = merged
     if mesh_groups:
         tris = np.concatenate(mesh_groups, axis=0)
         if len(tris) > 250_000:
-            # Keep precision; cap only runaway decorative colliders.
             tris = tris[:250_000]
         status(f"Building BVH ({len(tris)} triangles)")
         nodes, packed = build_bvh(np.asarray(tris, dtype=np.float32))
         world.tris = packed
         world.nodes = nodes
     if not world.ready():
-        return None, f"No terrain or colliders found in files for {slug}."
+        return None, f"No terrain or colliders found in Unity scenes for {slug}."
     hashes = [_file_hash(p) for p in files[:12]]
     save_collision(
         world,
         source="local tarkov colliders",
-        extra_meta={"files": [str(p.name) for p in files[:24]], "hashes": hashes, "scanned": scanned},
+        extra_meta={"files": [p.name for p in files[:24]], "hashes": hashes, "scanned": scanned},
     )
     status(f"Saved collision for {slug}")
     return world, "ok"
 
 
-def _read_terrain(obj) -> tuple[float, float, float, np.ndarray] | None:
+def _ptr_read(ptr):
+    if ptr is None:
+        return None
     try:
-        data = obj.read()
+        if int(getattr(ptr, "m_PathID", 0) or 0) == 0:
+            return None
+    except Exception:
+        pass
+    try:
+        return ptr.read()
     except Exception:
         return None
-    grid = None
-    for attr in ("Heightmap", "m_Heightmap", "heightmap"):
-        raw = getattr(data, attr, None)
-        if raw is None:
-            continue
-        heights = getattr(raw, "heights", None) or getattr(raw, "m_Heights", None) or raw
-        try:
-            grid = np.array(heights, dtype=np.float32)
-        except Exception:
-            continue
-        break
-    if grid is None:
+
+
+def _gameobject_transform(component) -> object | None:
+    go = _ptr_read(getattr(component, "m_GameObject", None))
+    if go is None:
         return None
-    if grid.ndim == 1:
+    for entry in getattr(go, "m_Component", None) or []:
+        ptr = getattr(entry, "component", None) or getattr(entry, "m_Component", None)
+        inner = _ptr_read(ptr)
+        if inner is not None and type(inner).__name__ == "Transform":
+            return inner
+    return None
+
+
+def _world_matrix(transform) -> np.ndarray:
+    mats: list[np.ndarray] = []
+    cur = transform
+    depth = 0
+    while cur is not None and depth < 24:
+        mats.append(_local_matrix(cur))
+        father = getattr(cur, "m_Father", None)
+        cur = _ptr_read(father)
+        depth += 1
+    world = np.eye(4, dtype=np.float64)
+    for mat in reversed(mats):
+        world = world @ mat
+    return world
+
+
+def _local_matrix(transform) -> np.ndarray:
+    p = getattr(transform, "m_LocalPosition", None)
+    q = getattr(transform, "m_LocalRotation", None)
+    s = getattr(transform, "m_LocalScale", None)
+    px = py = pz = 0.0
+    sx = sy = sz = 1.0
+    qx = qy = qz = 0.0
+    qw = 1.0
+    if p is not None:
+        px, py, pz = float(p.x), float(p.y), float(p.z)
+    if s is not None:
+        sx, sy, sz = float(s.x), float(s.y), float(s.z)
+    if q is not None:
+        qx, qy, qz, qw = float(q.x), float(q.y), float(q.z), float(q.w)
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+    rot = np.array(
+        [
+            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
+            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
+            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
+        ],
+        dtype=np.float64,
+    )
+    scale = np.diag([sx, sy, sz])
+    mat = np.eye(4, dtype=np.float64)
+    mat[:3, :3] = rot @ scale
+    mat[0, 3] = px
+    mat[1, 3] = py
+    mat[2, 3] = pz
+    return mat
+
+
+def _transform_points(points: np.ndarray, world: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64)
+    flat = pts.reshape(-1, 3)
+    ones = np.ones((len(flat), 1), dtype=np.float64)
+    out = (world @ np.concatenate([flat, ones], axis=1).T).T[:, :3]
+    return out.reshape(pts.shape).astype(np.float32)
+
+
+def _read_terrain_collider(obj) -> tuple[float, float, float, np.ndarray] | None:
+    try:
+        col = obj.read()
+    except Exception:
+        return None
+    td = _ptr_read(getattr(col, "m_TerrainData", None))
+    if td is None:
+        return None
+    hm = getattr(td, "m_Heightmap", None)
+    if hm is None:
+        return None
+    raw = getattr(hm, "m_Heights", None)
+    if raw is None:
+        return None
+    res = int(getattr(hm, "m_Resolution", 0) or 0)
+    grid = np.array(raw, dtype=np.float32)
+    if res <= 1:
         side = int(np.sqrt(grid.size))
         if side * side != grid.size:
             return None
-        grid = grid.reshape((side, side))
-    size = getattr(data, "size", None) or getattr(data, "m_Size", None)
+        res = side
+    grid = grid.reshape((res, res))
+    scale = getattr(hm, "m_Scale", None)
     try:
-        sx, sy, sz = float(size.x), float(size.y), float(size.z)
+        cell = float(scale.x)
+        size_y = float(scale.y)
     except Exception:
-        sx = sz = float(max(grid.shape) - 1)
-        sy = 1.0
-    rows, cols = grid.shape
-    cell = sx / max(1, cols - 1)
-    grid = grid * (sy if sy > 0.01 else 1.0)
-    pos = getattr(data, "position", None)
-    ox = float(getattr(pos, "x", 0.0) or 0.0)
-    oz = float(getattr(pos, "z", 0.0) or 0.0)
+        cell, size_y = 1.0, 1.0
+    if cell <= 1e-6:
+        cell = 1.0
+    grid = grid * (size_y / 65535.0)
+    tr = _gameobject_transform(col)
+    ox = oz = oy = 0.0
+    if tr is not None:
+        world = _world_matrix(tr)
+        ox, oy, oz = float(world[0, 3]), float(world[1, 3]), float(world[2, 3])
+        grid = grid + oy
     return ox, oz, cell, grid
 
 
-def _read_collider(obj, kind: str) -> np.ndarray | None:
+def _merge_height_slices(slices: list[tuple[float, float, float, np.ndarray]]) -> HeightField | None:
+    if not slices:
+        return None
+    cell = float(slices[0][2])
+    if cell <= 1e-6:
+        return None
+    min_x = min(ox for ox, _oz, _c, _g in slices)
+    min_z = min(oz for _ox, oz, _c, _g in slices)
+    max_x = max(ox + (g.shape[1] - 1) * cell for ox, _oz, _c, g in slices)
+    max_z = max(oz + (g.shape[0] - 1) * cell for _ox, oz, _c, g in slices)
+    cols = int(round((max_x - min_x) / cell)) + 1
+    rows = int(round((max_z - min_z) / cell)) + 1
+    cols = max(2, min(cols, 4096))
+    rows = max(2, min(rows, 4096))
+    out = np.full((rows, cols), np.nan, dtype=np.float32)
+    for ox, oz, _c, grid in slices:
+        x0 = int(round((ox - min_x) / cell))
+        z0 = int(round((oz - min_z) / cell))
+        h, w = grid.shape
+        x1, z1 = min(cols, x0 + w), min(rows, z0 + h)
+        if x1 <= 0 or z1 <= 0 or x0 >= cols or z0 >= rows:
+            continue
+        sx0, sz0 = max(0, -x0), max(0, -z0)
+        dst = out[z0 + sz0 : z1, x0 + sx0 : x1]
+        src = grid[sz0 : sz0 + dst.shape[0], sx0 : sx0 + dst.shape[1]]
+        mask = np.isnan(dst)
+        dst[mask] = src[mask]
+        out[z0 + sz0 : z1, x0 + sx0 : x1] = dst
+    fill = float(np.nanmedian(out)) if np.isfinite(out).any() else 0.0
+    out = np.where(np.isnan(out), fill, out).astype(np.float32)
+    return HeightField(min_x, min_z, cell, out)
+
+
+def _read_mesh_collider(obj, mesh_handler_cls) -> np.ndarray | None:
     try:
-        data = obj.read()
+        col = obj.read()
     except Exception:
         return None
-    if kind == "BoxCollider":
-        center = getattr(data, "center", None) or getattr(data, "m_Center", None)
-        size = getattr(data, "size", None) or getattr(data, "m_Size", None)
-        try:
-            cx, cy, cz = float(center.x), float(center.y), float(center.z)
-            sx, sy, sz = float(size.x), float(size.y), float(size.z)
-        except Exception:
-            return None
-        return box_triangles((cx - sx / 2, cy - sy / 2, cz - sz / 2), (cx + sx / 2, cy + sy / 2, cz + sz / 2))
-    mesh = getattr(data, "mesh", None) or getattr(data, "m_Mesh", None) or getattr(data, "sharedMesh", None)
+    mesh = _ptr_read(getattr(col, "m_Mesh", None) or getattr(col, "mesh", None) or getattr(col, "sharedMesh", None))
     if mesh is None:
         return None
     try:
-        mesh = mesh.read() if hasattr(mesh, "read") else mesh
+        handler = mesh_handler_cls(mesh)
+        handler.process()
+        verts = handler.m_Vertices
     except Exception:
-        pass
-    verts = getattr(mesh, "vertices", None) or getattr(mesh, "m_Vertices", None)
-    idx = getattr(mesh, "triangles", None) or getattr(mesh, "m_Triangles", None) or getattr(mesh, "indices", None)
-    if verts is None or idx is None:
         return None
+    if not verts:
+        return None
+    idx = getattr(mesh, "m_IndexBuffer", None) or getattr(mesh, "m_Triangles", None)
     try:
-        pts = np.array([[float(v.x), float(v.y), float(v.z)] if hasattr(v, "x") else list(v) for v in verts], dtype=np.float32)
-        tri_i = np.array(list(idx), dtype=np.int32).reshape((-1, 3))
-        return pts[tri_i]
+        tris_i = np.array(list(idx), dtype=np.int32).reshape((-1, 3))
+        pts = np.array(verts, dtype=np.float32)
+        local = pts[tris_i]
     except Exception:
         return None
+    tr = _gameobject_transform(col)
+    if tr is not None:
+        local = _transform_points(local, _world_matrix(tr))
+    return local
+
+
+def _read_box_collider(obj) -> np.ndarray | None:
+    try:
+        col = obj.read()
+    except Exception:
+        return None
+    center = getattr(col, "m_Center", None) or getattr(col, "center", None)
+    size = getattr(col, "m_Size", None) or getattr(col, "size", None)
+    try:
+        cx, cy, cz = float(center.x), float(center.y), float(center.z)
+        sx, sy, sz = float(size.x), float(size.y), float(size.z)
+    except Exception:
+        return None
+    local = box_triangles((cx - sx / 2, cy - sy / 2, cz - sz / 2), (cx + sx / 2, cy + sy / 2, cz + sz / 2))
+    tr = _gameobject_transform(col)
+    if tr is not None:
+        local = _transform_points(local, _world_matrix(tr))
+    return local
