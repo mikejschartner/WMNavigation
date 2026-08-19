@@ -36,6 +36,7 @@ from .marker_icons import (
     get_usable_icon,
     load_friend_marker_pixmap,
     load_player_marker_pixmap,
+    load_ping_marker_pixmap,
 )
 from .models import ItemInfo, LootSpot, MapLayerData, MapPoint
 from .paths import cache_dir
@@ -180,6 +181,7 @@ class MapView(QGraphicsView):
         self._hide_loose_stars = False
         self._quest_spots: list[MapPoint] = []
         self._friend_pings: list = []
+        self._world_pings: list = []
         self._haze_off_floor = True
         self._hide_locked_room_loot = False
         self._locked_loot_ids: set[str] = set()
@@ -189,6 +191,7 @@ class MapView(QGraphicsView):
         self._applied_keep_ground = False
         self._marker_items: list[QGraphicsItem] = []
         self._friend_items: list[QGraphicsItem] = []
+        self._ping_items: list[QGraphicsItem] = []
         self._route_items: list[QGraphicsItem] = []
         self._marker_scale = 0.85
         self._refreshing = False
@@ -714,6 +717,57 @@ class MapView(QGraphicsView):
             text.setOpacity(opacity)
             self.scene.addItem(text)
             self._friend_items.append(text)
+
+    def set_world_pings(self, pings: list, *, show_name: bool = True, show_distance: bool = True, show_time: bool = True):
+        self._world_pings = list(pings or [])
+        self._redraw_world_pings(show_name=show_name, show_distance=show_distance, show_time=show_time)
+
+    def _clear_world_pings(self):
+        for item in self._ping_items:
+            if item.scene():
+                self.scene.removeItem(item)
+        self._ping_items.clear()
+
+    def _redraw_world_pings(self, *, show_name: bool = True, show_distance: bool = True, show_time: bool = True):
+        self._clear_world_pings()
+        for ping in self._world_pings:
+            mx, my = game_to_map(ping.x, ping.z, self.map_rotation, self.map_transform)
+            if not self._in_map_bounds(mx, my):
+                continue
+            death = getattr(ping, "ping_type", "") == "death_last_ping"
+            color = getattr(ping, "color", None) or ("#ef4444" if death else "#fbbf24")
+            pix = load_ping_marker_pixmap(self._px(20), color=color, death=death)
+            marker = QGraphicsPixmapItem(pix)
+            marker.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            marker.setOffset(-pix.width() / 2, -pix.height() / 2)
+            marker.setPos(mx, my)
+            marker.setZValue(1850)
+            self.scene.addItem(marker)
+            self._ping_items.append(marker)
+            bits = []
+            if death:
+                bits.append(f"{ping.owner_name} LAST PING / DEATH")
+            else:
+                bits.append("PING")
+                if show_name:
+                    bits.append(str(ping.owner_name))
+            if show_distance and getattr(ping, "distance_m", 0):
+                bits.append(f"{ping.distance_m:.0f}m")
+            if show_time and ping.expires_at > 0:
+                bits.append(f"{ping.remaining_s():.0f}s")
+            text = QGraphicsSimpleTextItem(" ".join(bits))
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+            text.setBrush(QBrush(QColor(color)))
+            text.setPen(QPen(QColor("#0a0a0f"), 1))
+            font = QFont("Segoe UI", max(8, self._px(8)))
+            font.setBold(True)
+            text.setFont(font)
+            br = text.boundingRect()
+            text.setPos(mx, my)
+            text.setTransform(QTransform.fromTranslate(-br.width() / 2, pix.height() / 2 + 2))
+            text.setZValue(1851)
+            self.scene.addItem(text)
+            self._ping_items.append(text)
 
     def _on_active_floor(self, y: float, x: float | None = None, z: float | None = None) -> bool:
         if self._floor.label.lower() == "all floors":

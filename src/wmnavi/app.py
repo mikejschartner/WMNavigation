@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -89,9 +88,13 @@ from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_sc
 from .theme import STYLESHEET
 from .win_input import press_v_in_raid
 from .applog import get_logger
-from .visual.engine import VisualFilterEngine
-from .visual.toast import ProfileToast
-from .visual.ui import VisualProfilesPage
+from .camera_pose import pose_from_confirmed, pose_from_predicted, pitch_ok
+from .geometry_import import eft_is_running, find_eft_data_dir, import_map
+from .input_observe import InputObserver
+from .map_geometry import load_collision, raycast
+from .ping_manager import PING_DEATH, PING_NORMAL, MapPing, PingManager, ping_distance
+from .ping_toast import PingToast
+from .predictor import MovementPredictor
 
 COMPASS_YAW_DEG_PER_PX = 0.42
 log = get_logger("wmnavi.app")
@@ -137,6 +140,9 @@ class Bridge(QObject):
     friend_status = Signal(str)
     friend_joined = Signal(bool, str)
     route_ready = Signal(object)
+    map_ping = Signal(object)
+    import_status = Signal(str)
+    import_done = Signal(str, bool, str)
 
 
 class MainWindow(QMainWindow):
@@ -162,6 +168,9 @@ class MainWindow(QMainWindow):
         self.bridge.friend_status.connect(self.on_friend_status)
         self.bridge.friend_joined.connect(self.on_friend_joined, Qt.ConnectionType.QueuedConnection)
         self.bridge.route_ready.connect(self.on_route_ready)
+        self.bridge.map_ping.connect(self.on_remote_map_ping, Qt.ConnectionType.QueuedConnection)
+        self.bridge.import_status.connect(self._on_import_status, Qt.ConnectionType.QueuedConnection)
+        self.bridge.import_done.connect(self._on_import_done, Qt.ConnectionType.QueuedConnection)
 
         player_id = str(self.settings.value("friend_player_id", "") or "")
         if not player_id:
@@ -172,6 +181,7 @@ class MainWindow(QMainWindow):
             on_update=lambda snaps: self.bridge.friend_update.emit(snaps),
             on_status=lambda text: self.bridge.friend_status.emit(str(text)),
             on_join_result=lambda ok, room: self.bridge.friend_joined.emit(bool(ok), str(room or "")),
+            on_map_ping=lambda data: self.bridge.map_ping.emit(data),
         )
         self._friend_color = str(self.settings.value("friend_color", "#38bdf8") or "#38bdf8")
 
@@ -228,6 +238,21 @@ class MainWindow(QMainWindow):
         self.loot = LootValueService(self)
         self.loot.updated.connect(self._on_loot_updated)
         self._loot_value_on = False
+        self.predictor = MovementPredictor()
+        self.input_obs = InputObserver(self)
+        self.input_obs.sample.connect(self._on_prediction_tick)
+        self.ping_mgr = PingManager(player_id)
+        self.ping_toast = PingToast()
+        self._ping_on = self.settings.value("ping_enabled", False, type=bool)
+        self._prediction_on = self.settings.value("prediction_enabled", False, type=bool)
+        self._collision = None
+        self._importing = False
+        self._last_pred_tick = time.perf_counter()
+        self._last_friend_pub = 0.0
+        self._last_friend_xyz: tuple[float, float, float] | None = None
+        self._ping_expire_timer = QTimer(self)
+        self._ping_expire_timer.setInterval(1000)
+        self._ping_expire_timer.timeout.connect(self._redraw_world_pings)
         self._last_loc_ms = 0.0
         self.nav_graph = NavGraph()
         self._locked_loot_ids: set[str] = set()
@@ -243,9 +268,6 @@ class MainWindow(QMainWindow):
         self._auto_join_timer = QTimer(self)
         self._auto_join_timer.setSingleShot(True)
         self._auto_join_timer.timeout.connect(self._on_auto_join_timeout)
-        self.visual_engine = VisualFilterEngine(self)
-        self.visual_toast = ProfileToast()
-        self.visual_engine.status.connect(self._on_visual_status)
 
         self._build_ui()
         self.setStyleSheet(STYLESHEET)
@@ -275,6 +297,7 @@ class MainWindow(QMainWindow):
 
     def _start_global_hotkeys(self):
         try:
+            self._sync_ping_hotkeys()
             self.hotkeys.start()
         except Exception:
             pass
@@ -298,31 +321,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         shell = QWidget()
         self.setCentralWidget(shell)
-        shell_layout = QVBoxLayout(shell)
-        shell_layout.setContentsMargins(0, 0, 0, 0)
-        shell_layout.setSpacing(0)
-
-        nav = QFrame()
-        nav.setObjectName("mapOverlay")
-        nav_row = QHBoxLayout(nav)
-        nav_row.setContentsMargins(10, 6, 10, 6)
-        self.btn_page_map = QPushButton("Map")
-        self.btn_page_visual = QPushButton("Visual Profiles")
-        self.btn_page_map.setCheckable(True)
-        self.btn_page_visual.setCheckable(True)
-        self.btn_page_map.setObjectName("sectionToggle")
-        self.btn_page_visual.setObjectName("sectionToggle")
-        self.btn_page_map.setChecked(True)
-        self.btn_page_map.clicked.connect(lambda: self._show_main_page(0))
-        self.btn_page_visual.clicked.connect(lambda: self._show_main_page(1))
-        nav_row.addWidget(self.btn_page_map)
-        nav_row.addWidget(self.btn_page_visual)
-        nav_row.addStretch(1)
-        shell_layout.addWidget(nav)
-
-        self.page_stack = QStackedWidget()
-        map_page = QWidget()
-        layout = QHBoxLayout(map_page)
+        layout = QHBoxLayout(shell)
         layout.setContentsMargins(0, 0, 0, 0)
 
         sidebar = QFrame()
@@ -432,6 +431,82 @@ class MainWindow(QMainWindow):
         self.live_interval.valueChanged.connect(self.on_live_interval_changed)
         live_row.addWidget(self.live_interval)
         raid.body_layout.addLayout(live_row)
+
+        ping_hotkey_row = QHBoxLayout()
+        ping_hotkey_row.addWidget(QLabel("Ping key"))
+        self.combo_ping_hotkey = QComboBox()
+        for key, label in (
+            ("mbutton", "Middle Mouse"),
+            ("xbutton1", "Mouse 4"),
+            ("xbutton2", "Mouse 5"),
+            ("f1", "F1"),
+            ("f2", "F2"),
+            ("f3", "F3"),
+            ("f4", "F4"),
+        ):
+            self.combo_ping_hotkey.addItem(label, key)
+        saved_ping_key = str(self.settings.value("ping_hotkey", "mbutton") or "mbutton")
+        idx = self.combo_ping_hotkey.findData(saved_ping_key)
+        self.combo_ping_hotkey.setCurrentIndex(max(0, idx))
+        self.combo_ping_hotkey.currentIndexChanged.connect(self._on_ping_settings_changed)
+        ping_hotkey_row.addWidget(self.combo_ping_hotkey, 1)
+        raid.body_layout.addLayout(ping_hotkey_row)
+
+        ping_dur_row = QHBoxLayout()
+        ping_dur_row.addWidget(QLabel("Ping time"))
+        self.spin_ping_duration = QSpinBox()
+        self.spin_ping_duration.setRange(5, 120)
+        self.spin_ping_duration.setSuffix(" s")
+        self.spin_ping_duration.setValue(int(self.settings.value("ping_duration", 30) or 30))
+        self.spin_ping_duration.valueChanged.connect(self._on_ping_settings_changed)
+        ping_dur_row.addWidget(self.spin_ping_duration)
+        self.chk_ping_until_cleared = QCheckBox("Until cleared")
+        self.chk_ping_until_cleared.setChecked(self.settings.value("ping_until_cleared", False, type=bool))
+        self.chk_ping_until_cleared.stateChanged.connect(self._on_ping_settings_changed)
+        ping_dur_row.addWidget(self.chk_ping_until_cleared)
+        raid.body_layout.addLayout(ping_dur_row)
+
+        death_row = QHBoxLayout()
+        death_row.addWidget(QLabel("Death ping"))
+        self.combo_death_hotkey = QComboBox()
+        for key, label in (("f1", "F1"), ("f2", "F2"), ("f3", "F3"), ("f4", "F4"), ("mbutton", "Middle Mouse")):
+            self.combo_death_hotkey.addItem(label, key)
+        saved_death = str(self.settings.value("ping_death_hotkey", "f1") or "f1")
+        idx = self.combo_death_hotkey.findData(saved_death)
+        self.combo_death_hotkey.setCurrentIndex(max(0, idx))
+        self.combo_death_hotkey.currentIndexChanged.connect(self._on_ping_settings_changed)
+        death_row.addWidget(self.combo_death_hotkey, 1)
+        self.combo_death_duration = QComboBox()
+        self.combo_death_duration.addItem("Until raid ends", "raid")
+        self.combo_death_duration.addItem("Until cleared", "cleared")
+        self.combo_death_duration.addItem("30 seconds", "30")
+        self.combo_death_duration.addItem("60 seconds", "60")
+        self.combo_death_duration.addItem("2 minutes", "120")
+        self.combo_death_duration.addItem("5 minutes", "300")
+        saved_dd = str(self.settings.value("ping_death_duration", "raid") or "raid")
+        idx = self.combo_death_duration.findData(saved_dd)
+        self.combo_death_duration.setCurrentIndex(max(0, idx))
+        self.combo_death_duration.currentIndexChanged.connect(self._on_ping_settings_changed)
+        death_row.addWidget(self.combo_death_duration)
+        raid.body_layout.addLayout(death_row)
+
+        self.chk_ping_confirm = QCheckBox("Show ping confirmation")
+        self.chk_ping_confirm.setChecked(self.settings.value("ping_confirm", True, type=bool))
+        self.chk_ping_confirm.stateChanged.connect(self._on_ping_settings_changed)
+        raid.body_layout.addWidget(self.chk_ping_confirm)
+        ping_show = QHBoxLayout()
+        self.chk_ping_name = QCheckBox("Name")
+        self.chk_ping_dist = QCheckBox("Distance")
+        self.chk_ping_time = QCheckBox("Time")
+        self.chk_ping_teammates = QCheckBox("Teammates")
+        self.chk_ping_name.setChecked(self.settings.value("ping_show_name", True, type=bool))
+        self.chk_ping_dist.setChecked(self.settings.value("ping_show_distance", True, type=bool))
+        self.chk_ping_time.setChecked(self.settings.value("ping_show_time", True, type=bool))
+        self.chk_ping_teammates.setChecked(self.settings.value("ping_show_teammates", True, type=bool))
+        for box in (self.chk_ping_name, self.chk_ping_dist, self.chk_ping_time, self.chk_ping_teammates):
+            box.stateChanged.connect(self._on_ping_settings_changed)
+            ping_show.addWidget(box)
+        raid.body_layout.addLayout(ping_show)
 
         self.btn_center = QPushButton("Center on player")
         self.btn_center.clicked.connect(self.center_player)
@@ -649,6 +724,18 @@ class MainWindow(QMainWindow):
         self.btn_loot_route.clicked.connect(lambda: self.start_route("loot"))
         top_row.addWidget(self.btn_loot_route)
         top_row.addStretch(1)
+        self.btn_ping_system = QPushButton("Ping System")
+        self.btn_ping_system.setCheckable(True)
+        self.btn_ping_system.setToolTip("Middle-mouse (configurable) pings the world point under your crosshair. Separate from Prediction.")
+        self.btn_ping_system.setChecked(self.settings.value("ping_enabled", False, type=bool))
+        self.btn_ping_system.toggled.connect(self.on_ping_system_toggled)
+        top_row.addWidget(self.btn_ping_system)
+        self.btn_prediction = QPushButton("Prediction")
+        self.btn_prediction.setCheckable(True)
+        self.btn_prediction.setToolTip("Move your pin between V screenshots from real keys and mouse. Off = screenshot pins only.")
+        self.btn_prediction.setChecked(self.settings.value("prediction_enabled", False, type=bool))
+        self.btn_prediction.toggled.connect(self.on_prediction_toggled)
+        top_row.addWidget(self.btn_prediction)
         self.btn_loot_value = QPushButton("Loot Value")
         self.btn_loot_value.setCheckable(True)
         self.btn_loot_value.setToolTip(
@@ -685,21 +772,13 @@ class MainWindow(QMainWindow):
         splitter.splitterMoved.connect(self._keep_sidebar_open)
         QTimer.singleShot(0, self._keep_sidebar_open)
 
-        self.page_stack.addWidget(map_page)
-        self.visual_page = VisualProfilesPage(self.visual_engine, parent=self)
-        self.page_stack.addWidget(self.visual_page)
-        shell_layout.addWidget(self.page_stack, 1)
-
         self._set_mode_combo(self.current_game_mode)
         self.on_topmost()
         self._sync_live_timer()
         self._select_map_combo(self.current_map_slug)
         self._update_price_labels()
-
-    def _show_main_page(self, index: int):
-        self.page_stack.setCurrentIndex(int(index))
-        self.btn_page_map.setChecked(index == 0)
-        self.btn_page_visual.setChecked(index == 1)
+        self._sync_ping_hotkeys()
+        self._reload_collision()
 
     def _build_settings_widget(self):
         self.settings_widget = QWidget(self)
@@ -733,6 +812,40 @@ class MainWindow(QMainWindow):
         self.chk_tracking_debug.setToolTip("Show compass motion and loot-match numbers (not for normal raids).")
         self.chk_tracking_debug.toggled.connect(self.on_tracking_debug_toggled)
         layout.addWidget(self.chk_tracking_debug)
+
+        layout.addWidget(QLabel("Tarkov Data folder (collision import)"))
+        self.eft_path_edit = QLineEdit(str(self.settings.value("eft_data_dir", "") or ""))
+        self.eft_path_edit.setPlaceholderText("…\\EscapeFromTarkov_Data")
+        layout.addWidget(self.eft_path_edit)
+        eft_btns = QHBoxLayout()
+        self.btn_eft_browse = QPushButton("Browse")
+        self.btn_eft_browse.clicked.connect(self._browse_eft_data)
+        eft_btns.addWidget(self.btn_eft_browse)
+        self.btn_import_current = QPushButton("Import current map")
+        self.btn_import_current.setToolTip("Close Tarkov first. Builds a small collision cache for the map you have selected.")
+        self.btn_import_current.clicked.connect(lambda: self._start_import(all_maps=False))
+        eft_btns.addWidget(self.btn_import_current)
+        self.btn_import_all = QPushButton("Import all maps")
+        self.btn_import_all.clicked.connect(lambda: self._start_import(all_maps=True))
+        eft_btns.addWidget(self.btn_import_all)
+        layout.addLayout(eft_btns)
+        fov_row = QHBoxLayout()
+        fov_row.addWidget(QLabel("FOV"))
+        self.spin_fov = QSpinBox()
+        self.spin_fov.setRange(50, 90)
+        self.spin_fov.setValue(int(self.settings.value("tarkov_fov", 75) or 75))
+        self.spin_fov.valueChanged.connect(lambda v: self.settings.setValue("tarkov_fov", int(v)))
+        fov_row.addWidget(self.spin_fov)
+        fov_row.addWidget(QLabel("Predict max s"))
+        self.spin_pred_age = QSpinBox()
+        self.spin_pred_age.setRange(1, 12)
+        self.spin_pred_age.setValue(int(self.settings.value("prediction_max_age", 4) or 4))
+        self.spin_pred_age.valueChanged.connect(self._on_pred_age_changed)
+        fov_row.addWidget(self.spin_pred_age)
+        layout.addLayout(fov_row)
+        self.btn_reset_pred_calib = QPushButton("Reset prediction calibration")
+        self.btn_reset_pred_calib.clicked.connect(self._reset_prediction_calib)
+        layout.addWidget(self.btn_reset_pred_calib)
 
         self.btn_refresh = QPushButton("Refresh map data")
         self.btn_refresh.clicked.connect(lambda: self.load_map(self.current_map_slug, force_fetch=True))
@@ -1370,6 +1483,7 @@ class MainWindow(QMainWindow):
             self._refocus_minimap_view(mm, force_zoom=True)
         snaps = self.friend_sync.friends_snapshot() if self.friend_sync.room else {}
         mm.set_friends(list(snaps.values()), self.current_map_slug)
+        self._redraw_world_pings()
         if self._active_route and self._active_route.ok and self._active_route.waypoints:
             color = "#a855f7" if self._active_route.kind == "quest" else "#f59e0b"
             mm.set_route(self._active_route.waypoints, color=color, stops=self._active_route.stops)
@@ -1480,12 +1594,320 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Mini map opacity {pct}%")
         elif key == "f9":
             self._toggle_compass()
-        elif key == "f10":
-            on = self.visual_engine.toggle_filter()
-            self.status_label.setText("Visual Filter ON (F10)" if on else "Visual Filter OFF (F10)")
-        elif key == "f11":
-            name = self.visual_engine.cycle_profile()
-            self.status_label.setText(f"Visual Profile: {name}")
+        else:
+            ping_key = str(self.combo_ping_hotkey.currentData() or "mbutton")
+            death_key = str(self.combo_death_hotkey.currentData() or "f1")
+            if self._ping_on and key == ping_key:
+                self._do_crosshair_ping()
+            elif self._ping_on and key == death_key:
+                self._do_death_ping()
+
+    def _sync_ping_hotkeys(self):
+        extra = []
+        if hasattr(self, "combo_ping_hotkey"):
+            extra.append(str(self.combo_ping_hotkey.currentData() or "mbutton"))
+            extra.append(str(self.combo_death_hotkey.currentData() or "f1"))
+        if hasattr(self, "hotkeys"):
+            self.hotkeys.set_extra(extra)
+        if getattr(self, "_prediction_on", False):
+            self.input_obs.start()
+        else:
+            self.input_obs.stop()
+        if getattr(self, "_ping_on", False):
+            if not self._ping_expire_timer.isActive():
+                self._ping_expire_timer.start()
+        else:
+            self._ping_expire_timer.stop()
+        self.predictor.max_age_s = float(self.settings.value("prediction_max_age", 4) or 4)
+
+    def _on_ping_settings_changed(self, *_args):
+        self.settings.setValue("ping_hotkey", str(self.combo_ping_hotkey.currentData() or "mbutton"))
+        self.settings.setValue("ping_duration", int(self.spin_ping_duration.value()))
+        self.settings.setValue("ping_until_cleared", self.chk_ping_until_cleared.isChecked())
+        self.settings.setValue("ping_death_hotkey", str(self.combo_death_hotkey.currentData() or "f1"))
+        self.settings.setValue("ping_death_duration", str(self.combo_death_duration.currentData() or "raid"))
+        self.settings.setValue("ping_confirm", self.chk_ping_confirm.isChecked())
+        self.settings.setValue("ping_show_name", self.chk_ping_name.isChecked())
+        self.settings.setValue("ping_show_distance", self.chk_ping_dist.isChecked())
+        self.settings.setValue("ping_show_time", self.chk_ping_time.isChecked())
+        self.settings.setValue("ping_show_teammates", self.chk_ping_teammates.isChecked())
+        self._sync_ping_hotkeys()
+        self._redraw_world_pings()
+
+    def on_ping_system_toggled(self, on: bool):
+        self._ping_on = bool(on)
+        self.settings.setValue("ping_enabled", self._ping_on)
+        self._sync_ping_hotkeys()
+        if self._ping_on:
+            self._reload_collision()
+            ready = self._collision is not None and self._collision.ready()
+            self.status_label.setText(
+                "Ping System on" + ("" if ready else " · import this map's collision in Settings")
+            )
+        else:
+            self.status_label.setText("Ping System off")
+        self._redraw_world_pings()
+
+    def on_prediction_toggled(self, on: bool):
+        self._prediction_on = bool(on)
+        self.settings.setValue("prediction_enabled", self._prediction_on)
+        self._sync_ping_hotkeys()
+        if not self._prediction_on:
+            confirmed = self.predictor.confirmed_player()
+            if confirmed:
+                self._last_player = confirmed
+            self._apply_live_marker()
+            self.status_label.setText("Prediction off · screenshot pins only")
+        else:
+            self.status_label.setText("Prediction on · uses real keys and mouse between V")
+        self._last_pred_tick = time.perf_counter()
+
+    def _on_pred_age_changed(self, value: int):
+        self.settings.setValue("prediction_max_age", int(value))
+        self.predictor.max_age_s = float(value)
+
+    def _reset_prediction_calib(self):
+        self.predictor.reset_calibration()
+        self.status_label.setText("Prediction calibration cleared")
+
+    def _browse_eft_data(self):
+        start = self.eft_path_edit.text() or str(find_eft_data_dir() or "")
+        path = QFileDialog.getExistingDirectory(self, "EscapeFromTarkov_Data", start)
+        if path:
+            self.eft_path_edit.setText(path)
+            self.settings.setValue("eft_data_dir", path)
+
+    def _start_import(self, *, all_maps: bool):
+        if self._importing:
+            self.status_label.setText("Import already running")
+            return
+        if eft_is_running():
+            self.status_label.setText("Close Tarkov and the launcher before importing collision")
+            return
+        data_dir = find_eft_data_dir(self.eft_path_edit.text().strip() or None)
+        if not data_dir:
+            self.status_label.setText("Set the Tarkov Data folder in Settings")
+            return
+        self.settings.setValue("eft_data_dir", str(data_dir))
+        slugs = [self.current_map_slug]
+        if all_maps:
+            slugs = [slug for _label, slug in list_map_names()]
+        self._importing = True
+        self.status_label.setText("Importing collision…")
+
+        def work():
+            last_ok = False
+            last_msg = ""
+            for slug in slugs:
+                self.bridge.import_status.emit(f"Importing {slug}…")
+                _world, msg = import_map(slug, data_dir, on_status=lambda t: self.bridge.import_status.emit(t))
+                last_ok = msg == "ok"
+                last_msg = msg if msg != "ok" else f"Imported {slug}"
+            self.bridge.import_done.emit(slugs[-1], last_ok, last_msg)
+
+        threading.Thread(target=work, name="wmnavi-geom", daemon=True).start()
+
+    def _on_import_status(self, text: str):
+        self.status_label.setText(str(text))
+
+    def _on_import_done(self, slug: str, ok: bool, message: str):
+        self._importing = False
+        self.status_label.setText(message)
+        if slug == self.current_map_slug or ok:
+            self._reload_collision()
+
+    def _reload_collision(self):
+        self._collision = load_collision(self.current_map_slug)
+
+    def _pose_for_ping(self):
+        fov = float(self.settings.value("tarkov_fov", 75) or 75)
+        offset = self.predictor.calib.camera_height_offset
+        yaw_bias = self.predictor.calib.yaw_bias
+        pitch_bias = self.predictor.calib.pitch_bias
+        confirmed = self.predictor.confirmed_player() or self._last_player
+        if confirmed is None:
+            return None
+        age = self.predictor.time_since_confirm() if self.predictor.state.has_fix else 999.0
+        if self._prediction_on and age > 0.35:
+            pred = self.predictor.predicted_player()
+            if pred is not None:
+                return pose_from_predicted(
+                    pred,
+                    fov=fov,
+                    height_offset=offset,
+                    yaw_bias=yaw_bias,
+                    pitch_bias=pitch_bias,
+                    confidence=self.predictor.state.confidence,
+                )
+        return pose_from_confirmed(confirmed, fov=fov, height_offset=offset, yaw_bias=yaw_bias, pitch_bias=pitch_bias)
+
+    def _do_crosshair_ping(self):
+        if not self._ping_on:
+            return
+        if self._collision is None or not self._collision.ready():
+            self.status_label.setText(f"Ping unavailable / geometry not loaded for {self.current_map_slug}")
+            if self.chk_ping_confirm.isChecked():
+                self.ping_toast.show_message("Ping unavailable")
+            return
+        pose = self._pose_for_ping()
+        if pose is None:
+            self.status_label.setText("Ping failed · no confirmed position yet")
+            return
+        if not pitch_ok(pose):
+            self.status_label.setText("Ping failed · camera pitch confidence too low")
+            if self.chk_ping_confirm.isChecked():
+                self.ping_toast.show_message("Ping failed")
+            return
+        t0 = time.perf_counter()
+        hit = raycast(self._collision, (pose.x, pose.y, pose.z), pose.yaw, pose.pitch)
+        ms = (time.perf_counter() - t0) * 1000.0
+        if hit is None:
+            self.status_label.setText("Ping failed - no map intersection")
+            if self.chk_ping_confirm.isChecked():
+                self.ping_toast.show_message("Ping failed")
+            log.info(
+                "ping miss origin=%.1f,%.1f,%.1f yaw=%.1f pitch=%.1f src=%s %.1fms",
+                pose.x, pose.y, pose.z, pose.yaw, pose.pitch, pose.origin_source, ms,
+            )
+            return
+        name = self.friend_name_edit.text().strip() or "Operator"
+        duration = 0.0 if self.chk_ping_until_cleared.isChecked() else float(self.spin_ping_duration.value())
+        ping = self.ping_mgr.make_normal(
+            owner_name=name,
+            map_slug=self.current_map_slug,
+            x=hit.x,
+            y=hit.y,
+            z=hit.z,
+            duration_s=duration,
+            color=self._friend_color,
+            predicted_origin=pose.predicted_origin,
+            confidence=min(pose.yaw_confidence, pose.pitch_confidence),
+            distance_m=hit.distance,
+        )
+        self.ping_mgr.upsert(ping)
+        self.friend_sync.publish_map_ping(ping)
+        self._redraw_world_pings()
+        log.info(
+            "ping hit %.1f,%.1f,%.1f dist=%.1f kind=%s origin=%s predicted=%s %.1fms",
+            hit.x, hit.y, hit.z, hit.distance, hit.kind, pose.origin_source, pose.predicted_origin, ms,
+        )
+        if self.chk_ping_confirm.isChecked():
+            self.ping_toast.show_message("PING PLACED")
+        self.status_label.setText(f"Ping {hit.distance:.0f}m · {hit.kind}")
+
+    def _do_death_ping(self):
+        if not self._ping_on:
+            return
+        mode = str(self.combo_death_duration.currentData() or "raid")
+        until_raid = mode == "raid"
+        duration = 0.0 if mode in {"raid", "cleared"} else float(mode)
+        ping = self.ping_mgr.make_death(duration_s=duration, until_raid_end=until_raid)
+        if ping is None:
+            self.status_label.setText("No previous ping available.")
+            if self.chk_ping_confirm.isChecked():
+                self.ping_toast.show_message("No previous ping available.")
+            return
+        self.friend_sync.publish_map_ping(ping)
+        self._redraw_world_pings()
+        self.status_label.setText("Last ping / death marker sent")
+
+    def on_remote_map_ping(self, data: object):
+        if not isinstance(data, dict):
+            return
+        kind = str(data.get("type") or "")
+        if kind == "ping_remove":
+            pid = str(data.get("pingId") or "")
+            self.ping_mgr.remove(pid)
+            self._redraw_world_pings()
+            return
+        if kind != "ping_create":
+            return
+        if not self.chk_ping_teammates.isChecked() and str(data.get("ownerId") or "") != self.ping_mgr.owner_id:
+            return
+        try:
+            ping = MapPing(
+                ping_id=str(data.get("pingId") or ""),
+                ping_type=str(data.get("pingType") or PING_NORMAL),
+                owner_id=str(data.get("ownerId") or ""),
+                owner_name=str(data.get("ownerName") or "Friend")[:24],
+                map_slug=str(data.get("map") or ""),
+                x=float(data.get("x") or 0),
+                y=float(data.get("y") or 0),
+                z=float(data.get("z") or 0),
+                created_at=float(data.get("createdAt") or time.time()),
+                expires_at=float(data.get("expiresAt") or 0),
+                color=str(data.get("color") or "#38bdf8"),
+            )
+        except (TypeError, ValueError):
+            return
+        if not ping.ping_id:
+            return
+        self.ping_mgr.upsert(ping)
+        self._redraw_world_pings()
+
+    def _redraw_world_pings(self):
+        if not getattr(self, "chk_ping_teammates", None):
+            return
+        pings = self.ping_mgr.active(self.current_map_slug)
+        if self._last_player:
+            for ping in pings:
+                ping.distance_m = ping_distance(
+                    self._last_player.x, self._last_player.y, self._last_player.z, ping.x, ping.y, ping.z
+                )
+        kwargs = dict(
+            show_name=self.chk_ping_name.isChecked(),
+            show_distance=self.chk_ping_dist.isChecked(),
+            show_time=self.chk_ping_time.isChecked(),
+        )
+        self.map_view.set_world_pings(pings, **kwargs)
+        if self._minimap_ok():
+            self.minimap.map_view.set_world_pings(pings, **kwargs)
+
+    def _on_prediction_tick(self):
+        if not self._prediction_on:
+            return
+        now = time.perf_counter()
+        dt = now - self._last_pred_tick
+        self._last_pred_tick = now
+        keys = self.input_obs.keys()
+        dx, dy = self.input_obs.drain_mouse()
+        if self._prediction_on:
+            self.predictor.tick(
+                dt,
+                keys,
+                dx,
+                dy,
+                prediction_on=True,
+                bounds=self.map_view.map_bounds,
+                rotation=self.map_view.map_rotation,
+                transform=self.map_view.map_transform,
+            )
+            self._apply_live_marker()
+            if self.heading.has_heading:
+                pred = self.predictor.predicted_player()
+                if pred is not None:
+                    self.heading.predicted = pred.yaw_deg
+                    self.heading.display = pred.yaw_deg
+                    self.heading.game_yaw = pred.yaw_deg
+            if self.friend_sync.room:
+                live = self._live_player_state()
+                if live:
+                    moved = True
+                    if self._last_friend_xyz is not None:
+                        moved = ping_distance(live.x, live.y, live.z, *self._last_friend_xyz) > 0.25
+                    now_wall = time.time()
+                    if moved or (now_wall - self._last_friend_pub) >= 0.4:
+                        self._last_friend_pub = now_wall
+                        self._last_friend_xyz = (live.x, live.y, live.z)
+                        self.friend_sync.publish_position(
+                            map_slug=self.current_map_slug,
+                            x=live.x,
+                            y=live.y,
+                            z=live.z,
+                            yaw_deg=live.yaw_deg,
+                            name=self.friend_name_edit.text(),
+                            color=self._friend_color,
+                        )
 
     def on_marker_clicked(self, kind: str, point: object, item: ItemInfo | None):
         if kind == "quest" and isinstance(point, MapPoint):
@@ -1568,11 +1990,17 @@ class MainWindow(QMainWindow):
             self._select_map_combo(slug)
         self.status_label.setText(f"Raid detected → {slug.replace('-', ' ').title()}")
         self._sync_live_timer()
+        self.ping_mgr.raid_reset()
+        self.predictor.state.has_fix = False
+        self._reload_collision()
+        self._redraw_world_pings()
 
     @Slot()
     def on_raid_end(self):
         self.in_raid = False
         self._live_timer.stop()
+        self.ping_mgr.raid_reset()
+        self._redraw_world_pings()
         self.status_label.setText("Raid ended")
         if self.auto_delete:
             self.delete_raid_screenshots()
@@ -1621,6 +2049,14 @@ class MainWindow(QMainWindow):
             self.map_view.map_rotation,
             x=state.x,
             z=state.z,
+            transform=self.map_view.map_transform,
+        )
+        self.predictor.confirm(
+            state,
+            map_slug=self.current_map_slug,
+            loc_ms=self._last_loc_ms,
+            bounds=self.map_view.map_bounds,
+            rotation=self.map_view.map_rotation,
             transform=self.map_view.map_transform,
         )
         self._select_floor_for_player(state)
@@ -1770,11 +2206,6 @@ class MainWindow(QMainWindow):
             self.friend_status_label.setText("Could not automatically join the previous room.")
             self.btn_friend_join.setEnabled(True)
 
-    def _on_visual_status(self, text: str):
-        if str(text).startswith("Visual Profile:"):
-            self.visual_toast.show_message(text)
-            self.status_label.setText(text)
-
     @Slot(object)
     def on_friend_update(self, snaps):
         pings = list((snaps or {}).values())
@@ -1796,6 +2227,7 @@ class MainWindow(QMainWindow):
         self.btn_friend_join.setEnabled(not bool(self.friend_sync.room))
 
     def _refresh_friend_markers(self):
+        self._redraw_world_pings()
         if not self.friend_sync.room:
             return
         snaps = self.friend_sync.friends_snapshot()
@@ -1964,11 +2396,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
-            self.visual_engine.shutdown()
+            self.input_obs.stop()
         except Exception:
             pass
         try:
-            self.visual_toast.hide()
+            self.ping_toast.hide()
         except Exception:
             pass
         try:
@@ -1979,6 +2411,7 @@ class MainWindow(QMainWindow):
         self._live_timer.stop()
         self._minimap_heading_timer.stop()
         self._friend_prune_timer.stop()
+        self._ping_expire_timer.stop()
         self._route_refresh_timer.stop()
         try:
             if self.compass is not None:
@@ -2217,13 +2650,18 @@ class MainWindow(QMainWindow):
         self._update_tracking_debug()
 
     def _live_player_state(self) -> PlayerState | None:
-        return self._last_player
+        if self._prediction_on:
+            return self.predictor.predicted_player() or self._last_player
+        return self.predictor.confirmed_player() or self._last_player
 
     def _apply_live_marker(self):
         live = self._live_player_state()
         if live:
             self.map_view.set_player(live)
-        self.map_view.set_confirmed_ghost(None)
+        ghost = None
+        if self._tracking_debug and self._prediction_on:
+            ghost = self.predictor.confirmed_player()
+        self.map_view.set_confirmed_ghost(ghost, visible=bool(ghost and self._tracking_debug))
         if self._minimap_ok() and self.minimap.isVisible() and live:
             self.minimap.map_view.set_player(live)
             self._refocus_minimap_view(self.minimap.map_view)
@@ -2473,6 +2911,8 @@ class MainWindow(QMainWindow):
         self.map_view.set_floor(self.floor_options[0])
         self.map_view.set_house_index(self._houses)
         self.map_view.set_layer_data(self.layer_data)
+        self._reload_collision()
+        self._redraw_world_pings()
 
         prefix = self._layer_settings_prefix()
         self.layer_sidebar.rebuild(self.layer_data, prefix, self.settings)
@@ -2576,7 +3016,6 @@ def run():
         window = MainWindow()
         window.resize(1400, 900)
         window.setMinimumSize(720, 420)
-        app.aboutToQuit.connect(window.visual_engine.shutdown)
         window.show()
         sys.exit(app.exec())
     except Exception:

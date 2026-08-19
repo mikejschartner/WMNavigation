@@ -332,6 +332,27 @@ def load_friend_marker_pixmap(size: float = 28, color: str = "#38bdf8") -> QPixm
     return load_player_marker_pixmap(size, color=color)
 
 
+def load_ping_marker_pixmap(size: float = 22, color: str = "#fbbf24", death: bool = False) -> QPixmap:
+    size_i = max(10, int(round(size)))
+    cache = _cache_key("world_ping", f"{color}:{int(death)}", size_i)
+    if cache in _ICON_CACHE:
+        return _ICON_CACHE[cache]
+    fill = QColor("#ef4444" if death else color)
+
+    def draw(painter: QPainter, sz: int):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(fill)
+        painter.setPen(QPen(QColor("#0a0a0f"), max(1, sz // 12)))
+        painter.drawEllipse(2, 2, sz - 4, sz - 4)
+        painter.setBrush(QColor("#fff7ed"))
+        inner = max(3, sz // 4)
+        painter.drawEllipse(sz // 2 - inner // 2, sz // 2 - inner // 2, inner, inner)
+
+    pix = _draw_pixmap(size_i, draw)
+    _ICON_CACHE[cache] = pix
+    return pix
+
+
 def get_usable_icon(kind: str, size: float = 4) -> QPixmap:
     size_i = max(3, int(round(size)))
     cache = _cache_key("usable", kind, size_i)

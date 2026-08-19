@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .coords import PlayerState, quaternion_to_yaw_deg
+from .coords import PlayerState, quaternion_to_pitch_deg, quaternion_to_yaw_deg
 
 # Example:
 # 2025-03-30[21-04]_175.30, 1.37, 150.68_-0.01464, 0.98439, -0.14329, -0.10113_9.53 (0).png
@@ -23,17 +23,16 @@ def parse_screenshot(path: Path) -> PlayerState | None:
     if not match:
         return None
     groups = match.groupdict()
-    yaw = quaternion_to_yaw_deg(
-        float(groups["qx"]),
-        float(groups["qy"]),
-        float(groups["qz"]),
-        float(groups["qw"]),
-    )
+    qx = float(groups["qx"])
+    qy = float(groups["qy"])
+    qz = float(groups["qz"])
+    qw = float(groups["qw"])
     return PlayerState(
         x=float(groups["x"]),
         y=float(groups["y"]),
         z=float(groups["z"]),
-        yaw_deg=yaw,
+        yaw_deg=quaternion_to_yaw_deg(qx, qy, qz, qw),
+        pitch_deg=quaternion_to_pitch_deg(qx, qy, qz, qw),
     )
 
 

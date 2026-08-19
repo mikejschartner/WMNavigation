@@ -33,3 +33,9 @@ def cache_dir() -> Path:
     path = user_data_dir() / "cache"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def geometry_dir() -> Path:
+    path = user_data_dir() / "map_geometry"
+    path.mkdir(parents=True, exist_ok=True)
+    return path

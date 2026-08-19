@@ -1,6 +1,6 @@
 """Fail the build if the app cannot import or open a window.
 
-Run before tagging. GitHub Actions runs this before publishing the exe.
+Run before tagging. Publish only after this prints SMOKE OK.
 """
 
 from __future__ import annotations
@@ -46,6 +46,7 @@ def main() -> int:
         app.setApplicationName("WMNavigation-smoke")
         math_test = Path(__file__).resolve().parent / "test_tracking_math.py"
         floor_test = Path(__file__).resolve().parent / "test_floors.py"
+        ping_test = Path(__file__).resolve().parent / "test_ping.py"
         try:
             runpy.run_path(str(math_test), run_name="__main__")
         except SystemExit as exc:
@@ -56,6 +57,11 @@ def main() -> int:
         except SystemExit as exc:
             if exc.code not in (0, None):
                 raise RuntimeError(f"floor select tests failed: {exc.code}") from exc
+        try:
+            runpy.run_path(str(ping_test), run_name="__main__")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                raise RuntimeError(f"ping tests failed: {exc.code}") from exc
         window = MainWindow()
         window.show()
         QTimer.singleShot(400, app.quit)
@@ -69,8 +75,29 @@ def main() -> int:
             raise RuntimeError("map graphic missing after MainWindow load")
         if not hasattr(window, "btn_loot_value"):
             raise RuntimeError("Loot Value button missing")
+        if not hasattr(window, "btn_ping_system") or not hasattr(window, "btn_prediction"):
+            raise RuntimeError("Ping System and Prediction buttons missing")
+        if window.btn_ping_system is window.btn_prediction:
+            raise RuntimeError("Ping System and Prediction must be separate buttons")
+        pred_was = window.btn_prediction.isChecked()
+        ping_was = window.btn_ping_system.isChecked()
+        window.btn_ping_system.setChecked(True)
+        if window.btn_prediction.isChecked() and not pred_was:
+            raise RuntimeError("Ping System must not turn Prediction on")
+        window.btn_prediction.setChecked(True)
+        if not window.btn_ping_system.isChecked():
+            raise RuntimeError("Prediction must not turn Ping System off")
+        window.btn_ping_system.setChecked(False)
+        if not window.btn_prediction.isChecked():
+            raise RuntimeError("turning Ping System off must not turn Prediction off")
+        window.btn_ping_system.setChecked(ping_was)
+        window.btn_prediction.setChecked(pred_was)
         if hasattr(window, "btn_ai_prediction") or hasattr(window, "btn_audio_indicator"):
             raise RuntimeError("AI Prediction / Audio Indicator should be removed")
+        if hasattr(window, "btn_page_visual") or hasattr(window, "visual_page") or hasattr(window, "visual_engine"):
+            raise RuntimeError("Visual Profiles must be removed")
+        if hasattr(window, "page_stack"):
+            raise RuntimeError("Map/Visual page stack must be removed")
         if window.splitter.childrenCollapsible():
             raise RuntimeError("sidebar splitter must not be collapsible")
         from PySide6.QtWidgets import QScrollArea
@@ -142,44 +169,21 @@ def main() -> int:
         art_rect = art.sceneBoundingRect()
         if art_rect.width() < rect.width() * 0.5 or art_rect.height() < rect.height() * 0.5:
             raise RuntimeError(f"F7 overlay map misplaced: art={art_rect} scene={rect}")
-        if not hasattr(window, "btn_page_visual") or not hasattr(window, "visual_page"):
-            raise RuntimeError("Visual Profiles tab missing")
-        if window.page_stack.count() < 2:
-            raise RuntimeError("Visual Profiles page missing")
         if not hasattr(window, "chk_auto_join"):
             raise RuntimeError("Auto Join Last Room missing")
         from wmnavi.hotkeys import _KEYS
-        from wmnavi.visual.profiles import VisualProfileManager, VisualSettings
-        from wmnavi.visual.tone import build_gamma_ramp, identity_ramp
 
         names = {name for _vk, name in _KEYS}
-        if "f10" not in names or "f11" not in names:
-            raise RuntimeError("F10/F11 hotkeys missing")
-        red, green, blue = build_gamma_ramp(VisualSettings())
-        ident = identity_ramp()[0]
-        if red != ident or green != ident or blue != ident:
-            raise RuntimeError("default visual LUT is not identity")
-        mgr = VisualProfileManager()
-        mgr.draft.gamma = 4.0
-        if mgr.save_draft_to_active() or mgr.profiles[0].settings.gamma != 1.0:
-            raise RuntimeError("Default visual profile must stay unmodified")
-        mgr.select(1)
-        mgr.draft.gamma = 4.0
-        if not mgr.save_draft_to_active() or mgr.profiles[1].settings.gamma != 4.0:
-            raise RuntimeError("Profile 1 session save failed")
+        if "f10" in names or "f11" in names:
+            raise RuntimeError("F10/F11 visual hotkeys should be removed")
         leaked = [k for k in window.settings.allKeys() if "visual_profile" in str(k).lower()]
         if leaked:
             raise RuntimeError(f"Visual Profiles leaked into QSettings: {leaked}")
-        if window.visual_engine.manager.filter_enabled:
-            raise RuntimeError("Visual Filter must start OFF")
-        if window.visual_engine.manager.active_index != 0:
-            raise RuntimeError("Visual Profiles must start on Default")
         mmw = MiniMapWindow(size_px=180)
         center = QGraphicsView.ViewportAnchor.AnchorViewCenter
         if mmw.map_view.transformationAnchor() != center or mmw.map_view.resizeAnchor() != center:
             raise RuntimeError("F7 overlay must rotate around view center")
         mmw.close()
-        window.visual_engine.shutdown()
         print(f"SMOKE OK v{__version__} title={title}")
         return 0
     except Exception:

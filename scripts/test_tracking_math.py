@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,26 +50,48 @@ def test_predictor_confirm_and_motion():
     sample = MotionSample(0.05, yaw_flow_px=-2.0, fwd_flow_px=1.2, strafe_flow_px=0.0, feature_conf=0.7, capture_ok=True, process_ms=4.0)
     p.apply_motion(sample, prediction_on=True)
     assert p.state.has_fix
-    # Forward motion along +X at yaw 90
-    assert p.state.predicted_x != p.state.confirmed_x or p.state.speed >= 0.0
+    # Optical flow must not invent walking.
+    assert abs(p.state.predicted_x - 100.0) < 1e-9
+    assert abs(p.state.predicted_z - 200.0) < 1e-9
     b = PlayerState(101.2, 1, 200.1, 92)
     p.confirm(b, map_slug="customs")
     assert p.state.last_error_m >= 0.0
     assert p.calib.samples >= 1
 
 
-def test_predictor_coasts_when_flow_drops():
+def test_predictor_idle_and_off_and_max_age():
     p = MovementPredictor()
     p.reset_calibration()
     p.confirm(PlayerState(0, 1, 0, 0), map_slug="customs")
-    moving = MotionSample(0.05, 0.0, 2.0, 0.0, 0.8, True, 4.0)
-    p.apply_motion(moving, prediction_on=True)
-    z_after = p.state.predicted_z
-    assert z_after != 0.0
-    weak = MotionSample(0.05, 0.0, 0.0, 0.0, 0.05, True, 4.0)
-    p.apply_motion(weak, prediction_on=True)
-    # Should still have moved (coast), not snapped back to confirm.
-    assert abs(p.state.predicted_z) >= abs(z_after) * 0.5
+    idle = {"forward": False, "back": False, "left": False, "right": False, "sprint": False, "crouch": False}
+    p.tick(0.05, idle, 0, 0, prediction_on=True)
+    assert abs(p.state.predicted_z) < 1e-9
+    assert abs(p.state.predicted_x) < 1e-9
+    walk = {"forward": True, "back": False, "left": False, "right": False, "sprint": False, "crouch": False}
+    p.tick(0.1, walk, 0, 0, prediction_on=True)
+    assert p.state.predicted_z > 0.2
+    p.tick(0.1, walk, 0, 0, prediction_on=False)
+    assert abs(p.state.predicted_z) < 1e-9
+    p.tick(0.1, walk, 0, 0, prediction_on=True)
+    p.max_age_s = 0.01
+    p.state.last_confirm_at = time.perf_counter() - 1.0
+    frozen = p.state.predicted_z
+    p.tick(0.1, walk, 0, 0, prediction_on=True)
+    assert abs(p.state.predicted_z - frozen) < 1e-9
+
+
+def test_predictor_screenshot_overrides():
+    p = MovementPredictor()
+    p.reset_calibration()
+    p.confirm(PlayerState(0, 1, 0, 0), map_slug="customs")
+    walk = {"forward": True, "back": False, "left": False, "right": False, "sprint": False, "crouch": False}
+    p.tick(0.1, walk, 0, 0, prediction_on=True)
+    p.confirm(PlayerState(50, 2, 80, 45, pitch_deg=-10), map_slug="customs")
+    assert abs(p.state.confirmed_x - 50) < 1e-9
+    assert abs(p.state.confirmed_z - 80) < 1e-9
+    assert abs(p.state.predicted_x - 50) < 1e-6
+    assert abs(p.state.predicted_z - 80) < 1e-6
+    assert abs(p.state.confirmed_pitch + 10) < 1e-9
 
 
 def test_predictor_keys_walk_and_sprint():
@@ -294,7 +317,8 @@ def main() -> int:
     test_heading_visual_then_correct()
     test_large_heading_error_snaps()
     test_predictor_confirm_and_motion()
-    test_predictor_coasts_when_flow_drops()
+    test_predictor_idle_and_off_and_max_age()
+    test_predictor_screenshot_overrides()
     test_predictor_keys_walk_and_sprint()
     test_predictor_keys_idle_stops()
     test_apply_motion_skip_translation()

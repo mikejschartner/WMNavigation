@@ -50,11 +50,12 @@ class FriendPing:
 class FriendSync:
     """MQTT room client. Callbacks fire from the network thread — marshal to UI."""
 
-    def __init__(self, player_id: str, on_update=None, on_status=None, on_join_result=None):
+    def __init__(self, player_id: str, on_update=None, on_status=None, on_join_result=None, on_map_ping=None):
         self.player_id = player_id or new_player_id()
         self.on_update = on_update
         self.on_status = on_status
         self.on_join_result = on_join_result
+        self.on_map_ping = on_map_ping
         self.room = ""
         self.name = "Operator"
         self.color = "#38bdf8"
@@ -186,6 +187,9 @@ class FriendSync:
             parts = msg.topic.split("/")
             if len(parts) < 4:
                 return
+            if parts[3] == "mark":
+                self._on_ping_message(msg.payload)
+                return
             pid = parts[-1]
             if pid == self.player_id:
                 return
@@ -195,6 +199,8 @@ class FriendSync:
                 self._emit_update()
                 return
             data = json.loads(msg.payload.decode("utf-8", errors="ignore"))
+            if str(data.get("type") or "").startswith("ping"):
+                return
             ping = FriendPing(
                 player_id=pid,
                 name=str(data.get("name") or "Friend")[:24],
@@ -209,6 +215,67 @@ class FriendSync:
             with self._lock:
                 self._friends[pid] = ping
             self._emit_update()
+        except Exception:
+            pass
+
+    def _on_ping_message(self, payload: bytes):
+        if not self.on_map_ping:
+            return
+        if not payload:
+            return
+        try:
+            data = json.loads(payload.decode("utf-8", errors="ignore"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        kind = str(data.get("type") or "")
+        if kind not in {"ping_create", "ping_remove", "ping_expire"}:
+            return
+        try:
+            self.on_map_ping(data)
+        except Exception:
+            pass
+
+    def publish_map_ping(self, ping) -> None:
+        if not self.room or not self._client:
+            return
+        payload = {
+            "type": "ping_create",
+            "pingId": ping.ping_id,
+            "pingType": ping.ping_type,
+            "ownerId": ping.owner_id,
+            "ownerName": ping.owner_name,
+            "map": ping.map_slug,
+            "x": float(ping.x),
+            "y": float(ping.y),
+            "z": float(ping.z),
+            "createdAt": float(ping.created_at),
+            "expiresAt": float(ping.expires_at),
+            "color": ping.color,
+            "ts": time.time(),
+        }
+        try:
+            self._client.publish(
+                f"{TOPIC_ROOT}/{self.room}/mark/{ping.ping_id}",
+                payload=json.dumps(payload, separators=(",", ":")),
+                qos=0,
+                retain=False,
+            )
+        except Exception:
+            pass
+
+    def publish_ping_remove(self, ping_id: str) -> None:
+        if not self.room or not self._client:
+            return
+        payload = {"type": "ping_remove", "pingId": ping_id, "ownerId": self.player_id}
+        try:
+            self._client.publish(
+                f"{TOPIC_ROOT}/{self.room}/mark/{ping_id}",
+                payload=json.dumps(payload, separators=(",", ":")),
+                qos=0,
+                retain=False,
+            )
         except Exception:
             pass
 

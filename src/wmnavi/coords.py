@@ -12,17 +12,31 @@ class PlayerState:
     y: float
     z: float
     yaw_deg: float
+    pitch_deg: float = 0.0
+
+
+def quaternion_forward(qx: float, qy: float, qz: float, qw: float) -> tuple[float, float, float]:
+    """Unity camera forward (local +Z)."""
+    forward_x = 2.0 * (qx * qz + qw * qy)
+    forward_y = 2.0 * (qy * qz - qw * qx)
+    forward_z = 1.0 - 2.0 * (qx * qx + qy * qy)
+    return forward_x, forward_y, forward_z
 
 
 def quaternion_to_yaw_deg(qx: float, qy: float, qz: float, qw: float) -> float:
     """Convert Unity camera quaternion to compass yaw (0° = north / +Z)."""
-    # Forward vector from quaternion (Unity: camera looks along +Z local).
-    forward_x = 2.0 * (qx * qz + qw * qy)
-    forward_z = 1.0 - 2.0 * (qx * qx + qy * qy)
+    forward_x, _forward_y, forward_z = quaternion_forward(qx, qy, qz, qw)
     heading = math.degrees(math.atan2(forward_x, forward_z))
     if heading < 0:
         heading += 360.0
     return heading
+
+
+def quaternion_to_pitch_deg(qx: float, qy: float, qz: float, qw: float) -> float:
+    """Pitch in degrees: positive looks up. From the same screenshot quaternion as yaw."""
+    forward_x, forward_y, forward_z = quaternion_forward(qx, qy, qz, qw)
+    horiz = math.hypot(forward_x, forward_z)
+    return math.degrees(math.atan2(forward_y, max(1e-8, horiz)))
 
 
 def _apply_rotation(x: float, z: float, rotation: int) -> tuple[float, float]:
