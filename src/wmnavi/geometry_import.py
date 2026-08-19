@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .applog import get_logger
-from .map_geometry import CollisionWorld, HeightField, box_triangles, build_bvh, save_collision
+from .map_geometry import CollisionWorld, HeightField, align_heightfield_to_questie, box_triangles, build_bvh, save_collision
 
 log = get_logger("wmnavi.geometry")
 
@@ -340,11 +340,16 @@ def import_map(slug: str, data_dir: Path, on_status=None) -> tuple[CollisionWorl
     if not world.ready():
         extra = f" {first_read_err}" if first_read_err else ""
         return None, f"No terrain or colliders found in Unity scenes for {slug}.{extra}"
+    align_meta = align_heightfield_to_questie(world) or {}
     hashes = [_file_hash(p) for p in files[:12]]
+    extra_meta = {"files": [p.name for p in files[:24]], "hashes": hashes, "scanned": scanned}
+    extra_meta.update(align_meta)
+    if align_meta:
+        extra_meta["y_align_applied"] = True
     save_collision(
         world,
         source="local tarkov colliders",
-        extra_meta={"files": [p.name for p in files[:24]], "hashes": hashes, "scanned": scanned},
+        extra_meta=extra_meta,
     )
     status(f"Saved collision for {slug}")
     return world, "ok"
@@ -471,7 +476,12 @@ def _read_terrain_collider(obj) -> tuple[float, float, float, np.ndarray] | None
         cell, size_y = 1.0, 1.0
     if cell <= 1e-6:
         cell = 1.0
-    grid = grid * (size_y / 65535.0)
+    mx = float(np.nanmax(np.abs(grid))) if grid.size else 0.0
+    if mx <= 1.5:
+        grid = grid * size_y
+    else:
+        # Unity 16-bit heightmaps use ~32766 as 1.0 * size.y, not 65535.
+        grid = grid * (size_y / 32766.0)
     tr = _gameobject_transform(col)
     ox = oz = oy = 0.0
     if tr is not None:

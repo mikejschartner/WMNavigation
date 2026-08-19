@@ -188,6 +188,23 @@ def test_shoreline_uses_unity_levels():
     assert err is None, err
 
 
+def test_heightfield_y_fit_recovers_half_scale():
+    import numpy as np
+
+    from wmnavi.camera_pose import standing_eye_y
+    from wmnavi.map_geometry import fit_heightfield_y
+
+    hf = np.linspace(-80.0, -40.0, 40)
+    ref = 2.0 * hf + 100.0
+    fit = fit_heightfield_y(hf, ref)
+    assert fit is not None
+    a, b = fit
+    assert abs(a - 2.0) < 0.05
+    assert abs(b - 100.0) < 1.0
+    assert abs(standing_eye_y(-45.0, -45.0, None) - (-43.5)) < 0.01
+    assert abs(standing_eye_y(-43.5, -45.0, None) - (-43.5)) < 0.01
+
+
 def main() -> int:
     test_synthetic_wall_hill_building_miss()
     test_collision_roundtrip()
@@ -199,6 +216,7 @@ def main() -> int:
     test_ping_distance()
     test_expire_drops_old_ping()
     test_shoreline_uses_unity_levels()
+    test_heightfield_y_fit_recovers_half_scale()
     print("PING TESTS OK")
     return 0
 

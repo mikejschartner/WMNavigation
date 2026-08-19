@@ -88,7 +88,7 @@ from .screenshot import default_screenshot_dir, is_eft_screenshot_name, parse_sc
 from .theme import STYLESHEET
 from .win_input import press_v_in_raid
 from .applog import get_logger
-from .camera_pose import pose_from_confirmed, pose_from_predicted, pitch_ok
+from .camera_pose import pose_from_confirmed, pose_from_predicted, pitch_ok, standing_eye_y
 from .geometry_import import eft_is_running, find_eft_data_dir, import_map
 from .input_observe import InputObserver
 from .map_geometry import load_collision, raycast
@@ -1753,7 +1753,7 @@ class MainWindow(QMainWindow):
         if self._prediction_on and age > 0.35:
             pred = self.predictor.predicted_player()
             if pred is not None:
-                return pose_from_predicted(
+                pose = pose_from_predicted(
                     pred,
                     fov=fov,
                     height_offset=offset,
@@ -1761,7 +1761,16 @@ class MainWindow(QMainWindow):
                     pitch_bias=pitch_bias,
                     confidence=self.predictor.state.confidence,
                 )
-        return pose_from_confirmed(confirmed, fov=fov, height_offset=offset, yaw_bias=yaw_bias, pitch_bias=pitch_bias)
+                return self._apply_ground_eye(pose)
+        pose = pose_from_confirmed(confirmed, fov=fov, height_offset=offset, yaw_bias=yaw_bias, pitch_bias=pitch_bias)
+        return self._apply_ground_eye(pose)
+
+    def _apply_ground_eye(self, pose):
+        ground = None
+        if self._collision is not None and self._collision.height is not None:
+            ground = self._collision.height.sample(pose.x, pose.z)
+        pose.y = standing_eye_y(pose.y, ground, None)
+        return pose
 
     def _do_crosshair_ping(self):
         if not self._ping_on:

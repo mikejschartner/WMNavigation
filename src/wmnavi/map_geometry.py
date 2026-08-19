@@ -13,7 +13,10 @@ from pathlib import Path
 
 import numpy as np
 
+from .applog import get_logger
 from .paths import geometry_dir
+
+log = get_logger("wmnavi.geometry")
 
 MAGIC = b"WMNG"
 VERSION = 1
@@ -104,12 +107,22 @@ def load_collision(slug: str) -> CollisionWorld | None:
         world = _unpack(raw, slug)
     except Exception:
         return None
+    meta: dict = {}
     if meta_path.exists():
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             world.source = str(meta.get("source") or world.source)
         except (OSError, json.JSONDecodeError):
-            pass
+            meta = {}
+    if world.ready() and not meta.get("y_align_applied"):
+        extra = align_heightfield_to_questie(world)
+        if extra:
+            meta.update(extra)
+            meta["y_align_applied"] = True
+            try:
+                save_collision(world, source=str(meta.get("source") or world.source), extra_meta=meta)
+            except OSError:
+                log.warning("could not write Y-aligned collision for %s", slug)
     return world if world.ready() else None
 
 
@@ -129,6 +142,70 @@ def save_collision(world: CollisionWorld, *, source: str, extra_meta: dict | Non
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     world.source = source
     return bin_path
+
+
+def _questie_ground_points(slug: str) -> list[tuple[float, float, float]]:
+    try:
+        from .questie_source import find_map_entry
+    except Exception:
+        return []
+    entry = find_map_entry("regular", slug) or find_map_entry("pvp-season", slug)
+    if not entry:
+        return []
+    out: list[tuple[float, float, float]] = []
+    for key in ("spawns", "extracts"):
+        for item in entry.get(key) or []:
+            pos = item.get("position") or {}
+            if not isinstance(pos, dict):
+                continue
+            try:
+                out.append((float(pos["x"]), float(pos["y"]), float(pos["z"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return out
+
+
+def fit_heightfield_y(hf_vals: np.ndarray, ref_vals: np.ndarray) -> tuple[float, float] | None:
+    """Map imported terrain Y to questie ground Y: ref ≈ a * hf + b."""
+    hf = np.asarray(hf_vals, dtype=np.float64).reshape(-1)
+    ref = np.asarray(ref_vals, dtype=np.float64).reshape(-1)
+    if len(hf) < 16 or len(hf) != len(ref):
+        return None
+    span = float(hf.max() - hf.min())
+    if span < 4.0:
+        return 1.0, float(np.median(ref - hf))
+    design = np.column_stack([hf, np.ones(len(hf))])
+    ab, *_ = np.linalg.lstsq(design, ref, rcond=None)
+    a, b = float(ab[0]), float(ab[1])
+    if not (0.6 <= a <= 3.5) or not np.isfinite(b):
+        return 1.0, float(np.median(ref - hf))
+    return a, b
+
+
+def align_heightfield_to_questie(world: CollisionWorld) -> dict | None:
+    """Shift cached terrain Y to spawn/extract height. Does not reimport Unity files."""
+    if world.height is None or world.height.heights.size < 8:
+        return None
+    points = _questie_ground_points(world.slug)
+    if len(points) < 16:
+        return None
+    hf_vals: list[float] = []
+    ref_vals: list[float] = []
+    for x, y, z in points:
+        sample = world.height.sample(x, z)
+        if sample is None:
+            continue
+        hf_vals.append(float(sample))
+        ref_vals.append(float(y))
+    fit = fit_heightfield_y(np.asarray(hf_vals), np.asarray(ref_vals))
+    if fit is None:
+        return None
+    a, b = fit
+    if abs(a - 1.0) < 0.04 and abs(b) < 1.5:
+        return {"y_align_a": a, "y_align_b": b, "y_align_n": len(hf_vals), "y_align_applied": True}
+    world.height.heights = (world.height.heights.astype(np.float64) * a + b).astype(np.float32)
+    log.info("aligned %s terrain Y: y' = %.4f * y + %.3f (%d anchors)", world.slug, a, b, len(hf_vals))
+    return {"y_align_a": a, "y_align_b": b, "y_align_n": len(hf_vals)}
 
 
 def _pack(world: CollisionWorld) -> bytes:

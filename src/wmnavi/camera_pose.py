@@ -80,3 +80,17 @@ def pose_from_predicted(
 
 def pitch_ok(pose: CameraPose, min_conf: float = 0.35) -> bool:
     return pose.pitch_confidence >= min_conf
+
+
+def standing_eye_y(player_y: float, ground_y: float | None, extra_offset: float | None) -> float:
+    """Screenshot Y matches player root/spawns. Lift to eye height when sitting on the dirt."""
+    y = float(player_y)
+    if extra_offset is not None:
+        y += float(extra_offset)
+    if ground_y is None:
+        return y
+    ground = float(ground_y)
+    clearance = y - ground
+    if -0.5 <= clearance < 1.15:
+        return ground + 1.5
+    return y
